@@ -1,0 +1,90 @@
+rules_version = '2';
+
+// Kharcha security rules.
+// users/{uid}/...      a person's private book: only that signed-in person.
+// books/{bookId}       a shared book: its members, plus people invited by email (to see and accept the invite).
+// books/{bookId}/...   a shared book's entries, budgets, bills, goals and splits: members only.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function myEmail() { return request.auth.token.email.lower(); }
+    function verifiedEmail() { return request.auth.token.email_verified == true; }
+    function bookCols() { return ['meta', 'txns', 'goals', 'bills', 'splits']; }
+
+    // Basic shape checks so a broken client can't store junk entries.
+    function validEntry(col) {
+      let d = request.resource.data;
+      return col != 'txns' || (
+        d.amount is number && d.amount > 0 && d.amount < 1000000000000
+        && d.date is string && d.date.size() == 10
+        && d.type in ['expense', 'income']
+      );
+    }
+
+    // ----- Private books -----
+    match /users/{uid}/{col}/{docId} {
+      allow read, delete: if signedIn() && request.auth.uid == uid && col in bookCols();
+      allow create, update: if signedIn() && request.auth.uid == uid && col in bookCols() && validEntry(col);
+    }
+
+    // ----- Shared books -----
+    match /books/{bookId} {
+      function isMember() { return signedIn() && request.auth.uid in resource.data.members; }
+      function isOwner() { return signedIn() && resource.data.owner == request.auth.uid; }
+      function isInvited() { return signedIn() && verifiedEmail() && myEmail() in resource.data.invites; }
+      function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+      function infoChangedOnlyForMe() {
+        return request.resource.data.memberInfo.diff(resource.data.memberInfo).affectedKeys().hasOnly([request.auth.uid]);
+      }
+      function sane() {
+        let d = request.resource.data;
+        return d.name is string && d.name.size() > 0 && d.name.size() <= 60
+          && d.members is list && d.members.size() <= 20
+          && d.invites is list && d.invites.size() <= 20
+          && d.memberInfo is map;
+      }
+
+      allow read: if isMember() || isInvited();
+
+      allow create: if signedIn()
+        && request.resource.data.owner == request.auth.uid
+        && request.resource.data.members == [request.auth.uid]
+        && sane();
+
+      allow update: if sane() && (
+        // The owner can rename, invite, cancel invites and remove members, but never hand off or drop ownership.
+        (isOwner()
+          && request.resource.data.owner == resource.data.owner
+          && resource.data.owner in request.resource.data.members)
+        // Any member can invite people or cancel invitations.
+        || (isMember() && changed().hasOnly(['invites']))
+        // A member (not the owner) can leave.
+        || (isMember() && !isOwner()
+          && changed().hasOnly(['members', 'memberInfo'])
+          && request.resource.data.members == resource.data.members.removeAll([request.auth.uid])
+          && infoChangedOnlyForMe())
+        // An invited person can join: add themselves, drop their invite, add their own name and photo.
+        || (isInvited()
+          && changed().hasOnly(['members', 'invites', 'memberInfo'])
+          && request.resource.data.members == resource.data.members.concat([request.auth.uid])
+          && request.resource.data.invites == resource.data.invites.removeAll([myEmail()])
+          && infoChangedOnlyForMe())
+        // An invited person can decline.
+        || (isInvited()
+          && changed().hasOnly(['invites'])
+          && request.resource.data.invites == resource.data.invites.removeAll([myEmail()]))
+      );
+
+      allow delete: if isOwner();
+
+      match /{col}/{docId} {
+        function member() {
+          return signedIn() && request.auth.uid in get(/databases/$(database)/documents/books/$(bookId)).data.members;
+        }
+        allow read, delete: if member() && col in bookCols();
+        allow create, update: if member() && col in bookCols() && validEntry(col);
+      }
+    }
+  }
+}

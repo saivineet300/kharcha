@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<meta name="theme-color" content="#f7fbf2">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Kharcha">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<script src="firebase-config.js"></script>
+<!-- page:start -->
+<title>Kharcha</title>
+<meta name="description" content="Track daily expenses, budgets, bills, savings goals and shared costs. Includes a calculator and money tools.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200&icon_names=account_balance,account_balance_wallet,add,add_card,arrow_drop_down,auto_awesome,backspace,backup,beach_access,bolt,build,cake,calculate,category,celebration,check,check_circle,checkroom,chevron_left,chevron_right,child_care,close,cloud_done,cloud_off,credit_card,credit_score,currency_exchange,delete,delete_forever,directions_bus,directions_car,donut_large,download,edit,error,event,event_busy,event_repeat,favorite,filter_alt_off,fitness_center,flag,flight,group,group_add,headphones,history,home,hotel,laptop,link,local_bar,local_cafe,local_gas_station,local_grocery_store,local_laundry_service,local_pharmacy,local_taxi,lock,logout,mail,manage_accounts,medical_services,menu_book,movie,music_note,north_west,park,payments,person,person_add,person_remove,pets,qr_code_scanner,receipt,receipt_long,redeem,remove,restaurant,savings,schedule,schedule_send,school,science,search,search_off,sell,settings,settings_backup_restore,shopping_bag,show_chart,smartphone,spa,sports_esports,storefront,subscriptions,table_view,task_alt,train,trending_up,tv,two_wheeler,volunteer_activism,warning,water_drop,wifi,work&display=block">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="gate" class="gate" hidden></div>
+<div class="app" id="app">
+  <div id="banner"></div>
+  <main id="screen" class="screen">
+    <header class="topbar"><div class="brand"><span class="brand-mark" aria-hidden="true">₹</span><span>Kharcha</span></div></header>
+    <section class="hero hero--loading" aria-busy="true">
+      <div class="hero-label">Opening your expense book…</div>
+      <div class="hero-amount skeleton">₹ ——</div>
+    </section>
+  </main>
+  <button id="fab" class="fab" type="button" hidden></button>
+  <nav class="navbar" aria-label="Main">
+    <div class="nav-brand"><span class="brand-mark" aria-hidden="true">₹</span><span>Kharcha</span></div>
+    <button class="nav-fab" type="button" data-act="add"><span class="ms">add</span><span>Add expense</span></button>
+    <button class="nav-item" type="button" data-act="tab" data-tab="home"><span class="nav-ind"><span class="ms">home</span></span><span class="nav-label">Home</span></button>
+    <button class="nav-item" type="button" data-act="tab" data-tab="txns"><span class="nav-ind"><span class="ms">receipt_long</span></span><span class="nav-label">Activity</span></button>
+    <button class="nav-item" type="button" data-act="tab" data-tab="insights"><span class="nav-ind"><span class="ms">donut_large</span></span><span class="nav-label">Insights</span></button>
+    <button class="nav-item" type="button" data-act="tab" data-tab="plan"><span class="nav-ind"><span class="ms">savings</span></span><span class="nav-label">Plan</span></button>
+    <button class="nav-item" type="button" data-act="tab" data-tab="tools"><span class="nav-ind"><span class="ms">calculate</span></span><span class="nav-label">Tools</span></button>
+  </nav>
+</div>
+<div id="sheets"></div>
+<div id="dialog-root"></div>
+<div id="snackbar" class="snackbar" role="status" aria-live="polite" hidden></div>
+<div id="tip" class="chart-tip" role="tooltip" hidden></div>
+<script src="app.js"></script>
+<!-- page:end -->
+<script>
+  if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) {
+    navigator.serviceWorker.register('sw.js').catch(function () {});
+  }
+</script>
+</body>
+</html>
