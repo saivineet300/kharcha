@@ -41,6 +41,10 @@
   --gbtn-bg: #ffffff;
   --gbtn-ink: #1f1f1f;
   --gbtn-line: #747775;
+  /* WhatsApp reminder button */
+  --wa: #25d366;
+  --on-wa: #052e16;
+  --wa-ink: #0e7a3c;
 
   --income: #006e2c;
   --grid: #e3e7de;
@@ -105,6 +109,7 @@
     --hero-ink-2: rgb(230 246 230 / 0.74);
     --hero-track: rgb(255 255 255 / 0.14);
     --hero-fill: #7adb86; --hero-over: #ffb4ab; --gbtn-bg: #131314; --gbtn-ink: #e3e3e3; --gbtn-line: #8e918f;
+    --wa: #25d366; --on-wa: #052e16; --wa-ink: #4ade80;
     --income: #7adb86;
     --grid: #2a3029;
     --axis: #424940;
@@ -157,6 +162,7 @@
   --hero-ink-2: rgb(230 246 230 / 0.74);
   --hero-track: rgb(255 255 255 / 0.14);
   --hero-fill: #7adb86; --hero-over: #ffb4ab; --gbtn-bg: #131314; --gbtn-ink: #e3e3e3; --gbtn-line: #8e918f;
+  --wa: #25d366; --on-wa: #052e16; --wa-ink: #4ade80;
   --income: #7adb86;
   --grid: #2a3029;
   --axis: #424940;
@@ -822,6 +828,25 @@ input[type="range"] { width: 100%; accent-color: var(--primary); height: 28px; m
   background: hsl(var(--h, 200) calc(var(--cat-bg-s)) var(--cat-bg-l));
   color: hsl(var(--h, 200) var(--cat-fg-s) var(--cat-fg-l));
 }
+
+/* ---------- Friends ---------- */
+.split-cards { display: flex; flex-direction: column; gap: 12px; }
+.split-cards .section-title { font-size: 16px; color: var(--ink); padding: 4px 4px 0; }
+.tx-split { display: flex; flex-direction: column; gap: 10px; }
+.tx-split .seg button { font-size: 13px; }
+.tx-split .hint b, .friend-hero .hint b { color: var(--ink); font-weight: 500; }
+.li-end small { font-size: 12px; line-height: 16px; }
+.amt.faint { color: var(--ink-3); font-weight: 400; }
+.fr-body { display: flex; flex-direction: column; gap: 16px; }
+.friend-top { display: flex; align-items: center; gap: 16px; }
+.friend-label { font-size: 14px; color: var(--ink-2); }
+.friend-amt { font-size: 34px; line-height: 42px; font-weight: 500; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.friend-amt.in { color: var(--income); }
+.friend-actions, .friend-adds { display: flex; gap: 8px; flex-wrap: wrap; }
+.friend-actions .btn, .friend-adds .btn { flex: 1 1 160px; height: 44px; border-radius: 22px; }
+.btn-wa { background: var(--wa); color: var(--on-wa); }
+.btn-wa:hover { box-shadow: var(--shadow-1); }
+.icon-btn.wa-btn { color: var(--wa-ink); }
 
 /* ---------- Dialog ---------- */
 .dialog-scrim {

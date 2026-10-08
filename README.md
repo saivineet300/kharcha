@@ -1,6 +1,6 @@
 # Kharcha
 
-A Google-style expense tracker for phone and computer: daily expenses and income, budgets with alerts, bills and subscriptions, savings goals, splitting costs with friends, charts, a calculator, and money calculators (EMI, SIP, FD, GST, fuel, discount, inflation).
+A Google-style expense tracker for phone and computer: daily expenses and income, budgets with alerts, bills and subscriptions, savings goals, a running tab with each friend (with WhatsApp payment reminders), charts, a calculator, and money calculators (EMI, SIP, FD, GST, fuel, discount, inflation).
 
 With Google sign-in turned on, everyone gets a **private book**. You can also create **shared books** (for example "Home expenses") and invite family by email. Everyone in a shared book sees the same entries live, and each entry shows who added it.
 
@@ -51,6 +51,35 @@ Firebase is Google's free service for sign-in and databases. The free Spark plan
 4. After a minute the site is live at `https://YOUR-USERNAME.github.io/kharcha/`. Open it in Chrome and choose **Continue with Google**.
 
 On a phone, open the same address and choose **Add to Home Screen** (Safari) or **Install app** (Chrome). It then opens like a normal app and works offline.
+
+## Android app (APK)
+
+The `mobile/` folder packages the same app as an Android APK with [Capacitor](https://capacitorjs.com). It works fully offline.
+
+- **Install:** copy `Kharcha-1.0.apk` to your phone and open it. Android asks you to allow installing from that app (Files, Drive or Chrome) the first time.
+- **Where data lives:** your book is saved as files inside the app's private storage on the phone. After every change, a full backup is also written to **Documents/Kharcha** on the phone: the latest copy plus one per day for the past week. If you uninstall the app or move to a new phone, install Kharcha again, then go to **Settings → Restore from backup** and pick that file.
+- **Export and Back up** save to Documents/Kharcha and open Android's share menu, so you can send the file to Drive, WhatsApp or email.
+- **Updates keep your data,** as long as the new APK is signed with the same key. The key is stored on the computer that built the app at `~/.kharcha/` and isn't in this repository. Back that folder up: without it, a new version can't install over the old one.
+- Google sign-in and syncing inside the Android app come next, after the Firebase project is set up. Until then, the app keeps everything on the phone.
+
+To rebuild the APK after changing the web app (needs Node.js, JDK 21 and the Android SDK):
+
+```bash
+cd mobile
+npm install
+npm run apk
+```
+
+The signed APK is written to `mobile/android/app/build/outputs/apk/release/app-release.apk`.
+
+## Friends: paying for each other
+
+- **You paid for you and a friend:** tap **Add expense**, enter the full amount, and pick the friend under **Split with friends**. With **Split equally**, your half is added to your spending and the other half goes on the friend's tab.
+- **You paid only for them** (their ticket, their shopping): pick the friend and choose **Paid for them**. Nothing is added to your spending, and they owe you all of it.
+- **A friend paid:** go to **Plan → Friends**, open the friend and tap **[name] paid**. For bills with several people or uneven shares, use **Split a bill**.
+- **See the total:** **Plan → Friends** lists everyone with what they owe you. What they owe and what you owe them cancel out.
+- **Ask for the money:** open a friend and tap **Request on WhatsApp**. Your phone opens WhatsApp with a message listing each item and the total. Save their number once, or choose the chat in WhatsApp. Add your UPI ID in **Settings → Money** and it's included in the message.
+- **When they pay you back:** tap **Record payment**. The full amount settles everything. A smaller amount pays off their oldest items first.
 
 ## Using shared books
 

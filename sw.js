@@ -1,6 +1,6 @@
 // Offline support: app files are served cache-first and refreshed in the background;
 // Google Fonts and the Firebase SDK are cached after their first load.
-const VERSION = 'kharcha-v3';
+const VERSION = 'kharcha-v4';
 const SHELL = ['./', 'index.html', 'app.css', 'app.js', 'firebase-config.js', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png'];
 
 self.addEventListener('install', (event) => {

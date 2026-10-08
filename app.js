@@ -27,7 +27,11 @@
   // Inside a Claude artifact: the Claude account store. On the website with firebase-config.js
   // filled in: Google sign-in + Firestore. Otherwise: this browser only.
   const IN_CLAUDE = (() => { try { return !!(window.claude && typeof window.claude.use === 'function'); } catch { return false; } })();
-  const FB_CONFIG = !IN_CLAUDE && window.KHARCHA_FIREBASE && window.KHARCHA_FIREBASE.apiKey ? window.KHARCHA_FIREBASE : null;
+  // Inside the Android app (Capacitor), data is saved as files in the app's private storage.
+  const CAP = (() => { try { const c = window.Capacitor; return c && typeof c.isNativePlatform === 'function' && c.isNativePlatform() ? c : null; } catch { return null; } })();
+  const nativePlugin = (name) => (CAP && CAP.Plugins && CAP.Plugins[name]) || null;
+  // Google sign-in inside the Android app needs a native sign-in plugin, so for now the app keeps its book on the phone.
+  const FB_CONFIG = !IN_CLAUDE && !CAP && window.KHARCHA_FIREBASE && window.KHARCHA_FIREBASE.apiKey ? window.KHARCHA_FIREBASE : null;
   const FB_SDK = 'https://www.gstatic.com/firebasejs/12.19.0';
   const session = { mode: 'local', user: null, books: [], invites: [], bookId: 'personal', book: null, unsubs: [], openSeq: 0 };
   let fb = null;
@@ -108,6 +112,25 @@
   const fmtN = (n) => fmtNum.format(n);
   const pct = (x, d = 0) => `${(x * 100).toFixed(d)}%`;
 
+  // ---------- Friends ----------
+  // Friends are matched by name, ignoring capitals and extra spaces.
+  const fkey = (name) => String(name ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
+  // WhatsApp numbers are kept as digits with the country code, the way wa.me links want them.
+  // A 10-digit number typed without a code is taken as Indian while amounts are in rupees.
+  function phoneFromInput(raw) {
+    const s = String(raw ?? '').trim();
+    let d = s.replace(/\D/g, '');
+    if (!d) return '';
+    if (!s.startsWith('+')) {
+      if (d.startsWith('00')) d = d.slice(2);
+      else if (cur.code === 'INR' && d.length === 11 && d.startsWith('0')) d = '91' + d.slice(1);
+      else if (cur.code === 'INR' && d.length === 10) d = '91' + d;
+    }
+    return d.length >= 8 && d.length <= 15 ? d : '';
+  }
+  const cleanPhone = (v) => { const d = String(v ?? '').replace(/\D/g, ''); return d.length >= 8 && d.length <= 15 ? d : ''; };
+  const cleanUpi = (v) => { const s = String(v ?? '').trim().slice(0, 60); return /^[\w.-]{2,}@[A-Za-z][\w.-]*$/.test(s) ? s : ''; };
+
   // ============================================================
   // Categories, payment modes
   // ============================================================
@@ -116,6 +139,7 @@
     { id: 'groceries', name: 'Groceries', short: 'Groceries', icon: 'local_grocery_store', h: 88 },
     { id: 'transport', name: 'Transport', short: 'Transport', icon: 'directions_bus', h: 210 },
     { id: 'fuel', name: 'Fuel', short: 'Fuel', icon: 'local_gas_station', h: 4 },
+    { id: 'bike', name: 'Bike', short: 'Bike', icon: 'two_wheeler', h: 120 },
     { id: 'shopping', name: 'Shopping', short: 'Shopping', icon: 'shopping_bag', h: 318 },
     { id: 'bills', name: 'Bills & utilities', short: 'Bills', icon: 'receipt_long', h: 44 },
     { id: 'rent', name: 'Rent & housing', short: 'Rent', icon: 'home', h: 258 },
@@ -165,8 +189,9 @@
   // ============================================================
   // State
   // ============================================================
-  const DEFAULT_SETTINGS = { currency: 'INR', theme: 'system', name: '' };
-  const emptyData = () => ({ txns: [], budgets: { total: 0, cats: {} }, goals: [], bills: [], splits: [], customCats: [] });
+  const DEFAULT_SETTINGS = { currency: 'INR', theme: 'system', name: '', upi: '' };
+  // friends: name + WhatsApp number for people you split with. Who owes what lives in splits.
+  const emptyData = () => ({ txns: [], budgets: { total: 0, cats: {} }, goals: [], bills: [], splits: [], customCats: [], friends: [] });
   const state = { ...emptyData(), settings: { ...DEFAULT_SETTINGS }, sample: false, started: false, loaded: false };
   const ui = {
     tab: 'home',
@@ -174,13 +199,14 @@
     filter: { q: '', type: 'all', cat: '', mode: '' },
     insight: 'expense',
     plan: 'budgets',
+    allSplits: false,
     tools: 'calc',
     theme: 'system',
   };
   const toolVals = {};
   // While someone with their own data browses sample data, their book waits here untouched.
   let sampleStash = null;
-  const takeData = () => JSON.parse(JSON.stringify({ txns: state.txns, budgets: state.budgets, goals: state.goals, bills: state.bills, splits: state.splits, customCats: state.customCats }));
+  const takeData = () => JSON.parse(JSON.stringify({ txns: state.txns, budgets: state.budgets, goals: state.goals, bills: state.bills, splits: state.splits, customCats: state.customCats, friends: state.friends }));
   const calc = { expr: '', done: false, error: '', history: [] };
 
   // Per-viewer conveniences (tab, theme, calculator history) — never the book itself.
@@ -248,10 +274,86 @@
     } catch { /* not in a viewer */ }
     return Promise.resolve(null);
   };
+  // Android app: one JSON file per document in the app's private storage. A save writes a
+  // "<key>.new" copy first and removes it after the main file is written, so a crash
+  // mid-save never loses the latest data (loading prefers a leftover .new copy).
+  function phoneStore(FS) {
+    const dir = 'DATA';
+    const base = 'kharcha';
+    const read = async (name) => JSON.parse((await FS.readFile({ path: `${base}/${name}`, directory: dir, encoding: 'utf8' })).data);
+    return {
+      kind: 'phone',
+      async loadAll() {
+        const out = {};
+        let names = [];
+        try { names = ((await FS.readdir({ path: base, directory: dir })).files || []).map((f) => (typeof f === 'string' ? f : f.name)); } catch { return out; }
+        for (const name of names.filter((n) => n.endsWith('.json'))) {
+          try { out[name.slice(0, -5)] = await read(name); } catch { /* damaged file: a .new copy may cover it */ }
+        }
+        for (const name of names.filter((n) => n.endsWith('.new'))) {
+          try { out[name.slice(0, -4)] = await read(name); } catch { /* half-written copy: the .json file stands */ }
+        }
+        return out;
+      },
+      async set(key, data) {
+        const text = JSON.stringify(data);
+        await FS.writeFile({ path: `${base}/${key}.new`, directory: dir, encoding: 'utf8', data: text, recursive: true });
+        await FS.writeFile({ path: `${base}/${key}.json`, directory: dir, encoding: 'utf8', data: text, recursive: true });
+        await FS.deleteFile({ path: `${base}/${key}.new`, directory: dir }).catch(() => {});
+      },
+      async del(key) {
+        await FS.deleteFile({ path: `${base}/${key}.json`, directory: dir }).catch(() => {});
+        await FS.deleteFile({ path: `${base}/${key}.new`, directory: dir }).catch(() => {});
+      },
+    };
+  }
+
+  // Android app: after changes, keep a full backup in the phone's Documents/Kharcha folder
+  // (latest copy + one per day for a week). It survives uninstalling the app and can be
+  // restored with Settings → Restore from backup.
+  const backupInfo = { ok: null, at: 0 };
+  let backupTimer = null;
+  const backupPayload = () => ({ app: 'kharcha', v: 1, exportedAt: new Date().toISOString(), data: { txns: state.txns, budgets: state.budgets, goals: state.goals, bills: state.bills, splits: state.splits, customCats: state.customCats, friends: state.friends, settings: state.settings } });
+  function scheduleAutoBackup() {
+    if (store.kind !== 'phone' || state.sample) return;
+    clearTimeout(backupTimer);
+    backupTimer = setTimeout(autoBackup, 3000);
+  }
+  async function autoBackup() {
+    const FS = nativePlugin('Filesystem');
+    if (!FS || state.sample) return;
+    // Never replace a backup with an empty book (for example right after "Delete all data").
+    if (!state.txns.length && !state.goals.length && !state.bills.length && !state.splits.length) return;
+    const data = JSON.stringify(backupPayload(), null, 1);
+    const write = (name) => FS.writeFile({ path: `Kharcha/${name}`, directory: 'DOCUMENTS', encoding: 'utf8', data, recursive: true });
+    const names = () => { const b = prefs.backupBase || 'kharcha-backup'; return [`${b}-latest.json`, `${b}-${todayStr()}.json`]; };
+    try {
+      try {
+        for (const n of names()) await write(n);
+      } catch (e) {
+        // A file left by an earlier install of the app can't be overwritten; use fresh names instead.
+        if (prefs.backupBase) throw e;
+        prefs.backupBase = `kharcha-backup-${uid().slice(-4)}`;
+        prefsSave();
+        for (const n of names()) await write(n);
+      }
+      const b = prefs.backupBase || 'kharcha-backup';
+      const dated = ((await FS.readdir({ path: 'Kharcha', directory: 'DOCUMENTS' })).files || [])
+        .map((f) => (typeof f === 'string' ? f : f.name))
+        .filter((n) => n.startsWith(b + '-') && /-\d{4}-\d{2}-\d{2}\.json$/.test(n)).sort();
+      for (const old of dated.slice(0, -7)) await FS.deleteFile({ path: `Kharcha/${old}`, directory: 'DOCUMENTS' }).catch(() => {});
+      Object.assign(backupInfo, { ok: true, at: Date.now() });
+    } catch {
+      Object.assign(backupInfo, { ok: false, at: Date.now() });
+    }
+  }
+
   function localWorks() {
     try { const k = LS_PREFIX + '__t'; localStorage.setItem(k, '1'); localStorage.removeItem(k); return true; } catch { return false; }
   }
   async function pickStore() {
+    const FS = nativePlugin('Filesystem');
+    if (FS) return phoneStore(FS);
     const [db, user] = await Promise.all([capUse('db'), capUse('user')]);
     if (db && user) {
       try {
@@ -267,7 +369,7 @@
   // ---------- Documents <-> state ----------
   const ITEM_COLS = ['txns', 'goals', 'bills', 'splits'];
   function buildDocs() {
-    const meta = { v: 1, started: true, settings: state.settings, budgets: state.budgets, customCats: state.customCats };
+    const meta = { v: 1, started: true, settings: state.settings, budgets: state.budgets, customCats: state.customCats, friends: state.friends };
     if (store.granular) {
       // One document per entry, so two people editing different entries never overwrite each other.
       const out = { 'meta/main': meta };
@@ -291,13 +393,13 @@
     if (Object.keys(docs).some((k) => k.includes('/'))) {
       const m = docs['meta/main'] || {};
       const pick = (col) => Object.keys(docs).filter((k) => k.startsWith(col + '/')).map((k) => ({ ...docs[k], id: k.slice(col.length + 1) }));
-      const data = { settings: m.settings, budgets: m.budgets, customCats: m.customCats, txns: pick('txns'), goals: pick('goals'), bills: pick('bills'), splits: pick('splits') };
+      const data = { settings: m.settings, budgets: m.budgets, customCats: m.customCats, friends: m.friends, txns: pick('txns'), goals: pick('goals'), bills: pick('bills'), splits: pick('splits') };
       Object.assign(state, sanitizeData(data), { sample: false, started: true });
       return;
     }
     const m = docs.meta || {};
     const data = {
-      settings: m.settings, budgets: m.budgets, customCats: m.customCats,
+      settings: m.settings, budgets: m.budgets, customCats: m.customCats, friends: m.friends,
       goals: docs.goals && docs.goals.items, bills: docs.bills && docs.bills.items, splits: docs.splits && docs.splits.items,
       txns: Object.keys(docs).filter((k) => k.startsWith('tx-')).flatMap((k) => (docs[k] && docs[k].items) || []),
     };
@@ -311,6 +413,7 @@
     if (!CURRENCIES.some((c) => c.code === settings.currency)) settings.currency = 'INR';
     if (!['system', 'light', 'dark'].includes(settings.theme)) settings.theme = 'system';
     settings.name = str(settings.name, 40);
+    settings.upi = cleanUpi(settings.upi);
     const customCats = arr(d.customCats).filter((c) => c && c.id && c.name).map((c) => ({
       id: str(c.id, 40), name: str(c.name, 30), short: str(c.name, 12), type: c.type === 'income' ? 'income' : 'expense',
       icon: ICON_CHOICES.includes(c.icon) ? c.icon : 'sell', h: clamp(Number(c.h) || 0, 0, 360),
@@ -335,13 +438,33 @@
       freq: FREQ.includes(x.freq) ? x.freq : 'monthly', nextDue: x.nextDue, day: clamp(Number(x.day) || parseDate(x.nextDue).getDate(), 1, 31),
       mode: MODES.some((m) => m.id === x.mode) ? x.mode : 'upi', lastPaid: isDateStr(x.lastPaid) ? x.lastPaid : '',
     }));
-    const splits = arr(d.splits).filter((s) => s && s.title).map((s) => ({
-      id: safeId(s.id) || uid(), title: str(s.title, 50), date: isDateStr(s.date) ? s.date : todayStr(), total: pos(s.total),
-      paidBy: str(s.paidBy || 'me', 30) || 'me', myShare: Math.max(0, round2(Number(s.myShare) || 0)), iSettled: !!s.iSettled,
-      people: arr(s.people).filter((p) => p && p.name).map((p) => ({ name: str(p.name, 30), share: Math.max(0, round2(Number(p.share) || 0)), settled: !!p.settled })),
-      ...(s.txnId ? { txnId: str(s.txnId, 40) } : {}),
-    }));
-    return { settings, customCats, txns, budgets: { total: pos(b.total), cats }, goals, bills, splits };
+    // A share that has been partly paid back keeps how much came back so far (paid / myPaid);
+    // once it is all back it is simply settled.
+    const repaid = (share, settled, paid) => {
+      const v = clamp(round2(Number(paid) || 0), 0, share);
+      if (settled || (share > 0 && v >= share - 0.005)) return { settled: true, paid: 0 };
+      return { settled: false, paid: v };
+    };
+    const splits = arr(d.splits).filter((s) => s && s.title).map((s) => {
+      const myShare = Math.max(0, round2(Number(s.myShare) || 0));
+      const me = repaid(myShare, s.iSettled, s.myPaid);
+      return {
+        id: safeId(s.id) || uid(), title: str(s.title, 50), date: isDateStr(s.date) ? s.date : todayStr(), total: pos(s.total),
+        paidBy: str(s.paidBy || 'me', 30) || 'me', myShare, iSettled: me.settled, ...(me.paid ? { myPaid: me.paid } : {}),
+        people: arr(s.people).filter((p) => p && p.name).map((p) => {
+          const share = Math.max(0, round2(Number(p.share) || 0));
+          const r = repaid(share, p.settled, p.paid);
+          return { name: str(p.name, 30), share, settled: r.settled, ...(r.paid ? { paid: r.paid } : {}) };
+        }),
+        ...(s.txnId ? { txnId: str(s.txnId, 40) } : {}),
+      };
+    });
+    const friends = [];
+    arr(d.friends).forEach((f) => {
+      const name = f && str(f.name, 30).trim();
+      if (name && !friends.some((x) => fkey(x.name) === fkey(name))) friends.push({ name, phone: cleanPhone(f.phone) });
+    });
+    return { settings, customCats, txns, budgets: { total: pos(b.total), cats }, goals, bills, splits, friends };
   }
 
   // ---------- Persisting (diffs each document against what was last stored) ----------
@@ -379,6 +502,7 @@
       if (target.fireAndForget) Promise.resolve().then(write).catch(fail).finally(() => { pendingWrites--; });
       else writeChain = writeChain.then(write).catch(fail).finally(() => { pendingWrites--; });
     }
+    scheduleAutoBackup();
   }
   function saveErrorText(e) {
     const code = (e && (e.code || e.name)) || '';
@@ -423,10 +547,11 @@
     const slash = key.indexOf('/');
     const col = key.slice(0, slash), id = key.slice(slash + 1);
     if (col === 'meta') {
-      const clean = sanitizeData({ settings: data && data.settings, budgets: data && data.budgets, customCats: data && data.customCats });
+      const clean = sanitizeData({ settings: data && data.settings, budgets: data && data.budgets, customCats: data && data.customCats, friends: data && data.friends });
       if (target === state) { state.settings = clean.settings; setCurrency(clean.settings.currency); }
       target.budgets = clean.budgets;
       target.customCats = clean.customCats;
+      target.friends = clean.friends;
       return;
     }
     if (!ITEM_COLS.includes(col)) return;
@@ -515,6 +640,7 @@
       if (last >= 8) add('expense', 'bills', 799, ds(8), 'Broadband');
       if (last >= 18) add('expense', 'recharge', 299, ds(18), 'Mobile recharge');
       if (last >= 22) add('expense', 'subs', 199, ds(22), 'Netflix');
+      if (back % 3 === 1 && last >= 16) add('expense', 'bike', between(900, 1800, 50), ds(16), 'Bike service');
       if (back === 3 && last >= 14) add('expense', 'travel', 6400, ds(14), 'Train tickets – Goa trip', 'credit');
       if (back === 1 && last >= 10) add('expense', 'education', 2499, ds(10), 'Online course', 'credit');
     }
@@ -531,7 +657,7 @@
       { id: 's-b3', name: 'Electricity', amount: 1600, cat: 'bills', freq: 'monthly', nextDue: addDays(t, 2), day: parseDate(addDays(t, 2)).getDate(), mode: 'upi' },
       { id: 's-b4', name: 'Mobile recharge', amount: 299, cat: 'recharge', freq: 'monthly', nextDue: dueOn(18), day: 18, mode: 'upi' },
       { id: 's-b5', name: 'Netflix', amount: 199, cat: 'subs', freq: 'monthly', nextDue: dueOn(22), day: 22, mode: 'credit' },
-      { id: 's-b6', name: 'Bike insurance', amount: 2850, cat: 'bills', freq: 'yearly', nextDue: addDays(t, 41), day: parseDate(addDays(t, 41)).getDate(), mode: 'upi' },
+      { id: 's-b6', name: 'Bike insurance', amount: 2850, cat: 'bike', freq: 'yearly', nextDue: addDays(t, 41), day: parseDate(addDays(t, 41)).getDate(), mode: 'upi' },
     ];
     const inMonths = (n) => { const d = new Date(); d.setMonth(d.getMonth() + n); return toDateStr(d); };
     const goals = [
@@ -541,12 +667,16 @@
     ];
     const splits = [
       { id: 's-s1', title: 'Team dinner', date: addDays(t, -3), total: 3200, paidBy: 'me', myShare: 800, iSettled: false,
-        people: [{ name: 'Rahul', share: 800, settled: false }, { name: 'Priya', share: 800, settled: false }, { name: 'Arjun', share: 800, settled: true }] },
+        people: [{ name: 'Rahul', share: 800, settled: false }, { name: 'Priya', share: 800, settled: false, paid: 300 }, { name: 'Arjun', share: 800, settled: true }] },
       { id: 's-s2', title: 'Weekend movie', date: addDays(t, -6), total: 900, paidBy: 'Priya', myShare: 300, iSettled: false,
         people: [{ name: 'Priya', share: 300, settled: true }, { name: 'Neha', share: 300, settled: false }] },
+      { id: 's-s3', title: 'Lunch at Meghana’s', date: addDays(t, -1), total: 1240, paidBy: 'me', myShare: 620, iSettled: false,
+        people: [{ name: 'Rahul', share: 620, settled: false }] },
+      { id: 's-s4', title: 'Rahul’s bus ticket', date: addDays(t, -9), total: 450, paidBy: 'me', myShare: 0, iSettled: false,
+        people: [{ name: 'Rahul', share: 450, settled: false }] },
     ];
     const budgets = { total: 42000, cats: { food: 9000, groceries: 6000, transport: 2500, fuel: 4500, shopping: 3000, entertainment: 1500, bills: 3500 } };
-    return { txns, bills, goals, splits, budgets, customCats: [] };
+    return { txns, bills, goals, splits, budgets, customCats: [], friends: [] };
   }
   function loadSample() {
     Object.assign(state, makeSample(), { sample: true });
@@ -594,18 +724,61 @@
     return { cls: '', icon: 'event', text: `Due ${dateLabel(b.nextDue)}`, n };
   }
   const monthlyEquiv = (b) => (b.freq === 'yearly' ? b.amount / 12 : b.freq === 'quarterly' ? b.amount / 3 : b.freq === 'weekly' ? (b.amount * 52) / 12 : b.amount);
-  function splitBalances() {
-    const people = new Map();
+  // What is still to come back on one share, and on your own share of a bill someone else paid.
+  const shareLeft = (p) => (p.settled ? 0 : round2(Math.max(0, p.share - (p.paid || 0))));
+  const myLeft = (s) => (s.iSettled ? 0 : round2(Math.max(0, s.myShare - (s.myPaid || 0))));
+  // Everything between you and each friend. Items are oldest first; dir 1 = they owe you
+  // (you paid), dir -1 = you owe them (they paid). net > 0 means they owe you overall.
+  function friendLedger() {
+    const map = new Map();
+    const get = (name) => {
+      const k = fkey(name);
+      if (!map.has(k)) map.set(k, { key: k, name: String(name).trim(), phone: '', net: 0, items: [], last: '' });
+      return map.get(k);
+    };
+    for (const f of state.friends) Object.assign(get(f.name), { name: f.name, phone: f.phone });
     for (const s of state.splits) {
       if (s.paidBy === 'me') {
-        for (const p of s.people) if (!p.settled) people.set(p.name, (people.get(p.name) || 0) + p.share);
-      } else if (!s.iSettled && s.myShare > 0) {
-        people.set(s.paidBy, (people.get(s.paidBy) || 0) - s.myShare);
+        s.people.forEach((p, i) => {
+          if (!(p.share > 0)) return;
+          const f = get(p.name);
+          const left = shareLeft(p);
+          f.items.push({ s, i, dir: 1, share: p.share, left });
+          f.net += left;
+          if (s.date > f.last) f.last = s.date;
+        });
+      } else if (s.myShare > 0) {
+        const f = get(s.paidBy);
+        const left = myLeft(s);
+        f.items.push({ s, i: 'me', dir: -1, share: s.myShare, left });
+        f.net -= left;
+        if (s.date > f.last) f.last = s.date;
       }
     }
-    const list = [...people].map(([name, net]) => ({ name, net: round2(net) })).filter((p) => Math.abs(p.net) > 0.009).sort((a, b) => b.net - a.net);
+    for (const f of map.values()) {
+      f.net = round2(f.net);
+      f.items.sort((a, b) => a.s.date.localeCompare(b.s.date) || a.s.id.localeCompare(b.s.id));
+    }
+    return map;
+  }
+  function splitBalances() {
+    const list = [...friendLedger().values()].filter((p) => Math.abs(p.net) > 0.009).sort((a, b) => b.net - a.net);
     return { list, owed: sum(list.filter((p) => p.net > 0), (p) => p.net), owe: -sum(list.filter((p) => p.net < 0), (p) => p.net) };
   }
+  // How a bill divides between you (index 0) and the people named. 'equal': everyone pays the
+  // same. 'others': whoever paid isn't part of it, the rest share it equally. Rounding paise go
+  // to the first person who has a share.
+  function divideBill(total, names, paidBy, how) {
+    const out = Array(names.length + 1).fill(0);
+    const payer = paidBy === 'me' ? 0 : names.indexOf(paidBy) + 1;
+    const takers = out.map((_, i) => i).filter((i) => how !== 'others' || i !== payer);
+    if (!takers.length || !(total > 0)) return out;
+    const each = round2(total / takers.length);
+    takers.forEach((i) => { out[i] = each; });
+    out[takers[0]] = round2(total - each * (takers.length - 1));
+    return out;
+  }
+  const namesList = (names) => (names.length <= 2 ? names.join(' and ') : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`);
   function goalPlan(g) {
     const left = Math.max(0, g.target - g.saved);
     if (!g.deadline || left <= 0) return { left, perMonth: 0, months: 0 };
@@ -624,9 +797,13 @@
     const root = document.documentElement;
     if (t === 'light' || t === 'dark') root.setAttribute('data-app-theme', t); else root.removeAttribute('data-app-theme');
     const meta = document.querySelector('meta[name="theme-color"]');
-    if (meta) {
-      const bg = getComputedStyle(root).getPropertyValue('--bg').trim();
-      if (bg) meta.setAttribute('content', bg);
+    const bg = getComputedStyle(root).getPropertyValue('--bg').trim();
+    if (meta && bg) meta.setAttribute('content', bg);
+    const bar = nativePlugin('StatusBar');
+    if (bar && bg) {
+      const dark = t === 'dark' || (t === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      bar.setBackgroundColor({ color: bg }).catch(() => {});
+      bar.setStyle({ style: dark ? 'DARK' : 'LIGHT' }).catch(() => {});
     }
   }
   try {
@@ -653,7 +830,10 @@
     const c = getCat(t.cat);
     const title = t.note || c.name;
     const who = session.book && t.by ? memberName(t.by) : null;
-    const sub = [t.note ? c.name : null, modeOf(t.mode).name, who, showDate ? dayLabel(t.date) : null].filter(Boolean).join(' · ');
+    const sp = t.splitId ? state.splits.find((s) => s.id === t.splitId) : null;
+    const mates = sp ? sp.people.map((p) => p.name) : [];
+    const withWho = !mates.length ? null : mates.length <= 2 ? `with ${mates.join(' & ')}` : `with ${mates[0]} +${mates.length - 1}`;
+    const sub = [t.note ? c.name : null, withWho, modeOf(t.mode).name, who, showDate ? dayLabel(t.date) : null].filter(Boolean).join(' · ');
     const isIn = t.type === 'income';
     return `<button class="li" type="button" data-act="open-tx" data-id="${esc(t.id)}">
       ${catIco(c)}
@@ -713,7 +893,7 @@
     let f = null;
     if (ui.tab === 'home' || ui.tab === 'txns') f = { label: 'Add expense', icon: 'add', act: 'add' };
     if (ui.tab === 'plan') {
-      f = { budgets: { label: 'Edit budgets', icon: 'edit', act: 'edit-budgets' }, goals: { label: 'New goal', icon: 'add', act: 'add-goal' }, bills: { label: 'Add bill', icon: 'add', act: 'add-bill' }, split: { label: 'New split', icon: 'add', act: 'add-split' } }[ui.plan];
+      f = { budgets: { label: 'Edit budgets', icon: 'edit', act: 'edit-budgets' }, goals: { label: 'New goal', icon: 'add', act: 'add-goal' }, bills: { label: 'Add bill', icon: 'add', act: 'add-bill' }, split: { label: 'Split a bill', icon: 'add', act: 'add-split' } }[ui.plan];
     }
     fab.hidden = !f || !state.loaded;
     if (f) { fab.innerHTML = `${ic(f.icon)}<span>${f.label}</span>`; fab.dataset.act = f.act; }
@@ -734,6 +914,8 @@
     drawCharts(screen);
     updateChrome();
     if (lastTab !== ui.tab) { window.scrollTo(0, 0); lastTab = ui.tab; }
+    // Open pages that show live numbers (a friend's balance) redraw with the new data.
+    sheets.forEach((sh) => { if (sh.onData) sh.onData(); });
   }
   function setTab(tab) {
     if (!['home', 'txns', 'insights', 'plan', 'tools'].includes(tab)) tab = 'home';
@@ -771,7 +953,7 @@
     const amt = money(exp);
     const amtHtml = esc(amt).replace(/(\.\d\d)$/, '<span class="dec">$1</span>');
 
-    const quick = ['food', 'transport', 'fuel', 'groceries', 'shopping', 'bills', 'recharge', 'health'].map((id) => {
+    const quick = ['food', 'transport', 'fuel', 'bike', 'groceries', 'shopping', 'bills', 'recharge', 'health'].map((id) => {
       const c = getCat(id);
       return `<button class="quick-tile" type="button" data-act="add" data-cat="${c.id}">${catIco(c, 'lg')}<span>${esc(c.short)}</span></button>`;
     }).join('') + `<button class="quick-tile" type="button" data-act="add" data-type="income"><span class="cat-ico lg" style="--h:145">${ic('add_card')}</span><span>Income</span></button>`;
@@ -792,7 +974,9 @@
       if (st.n < 0) alerts.push({ w: 4, cls: 'err', icon: 'event_busy', html: `<b>${esc(b.name)}</b> bill of ${esc(money(b.amount))} is overdue`, act: 'data-act="goto" data-tab="plan" data-plan="bills"' });
     });
     const sb = splitBalances();
-    if (sb.owed > 0) alerts.push({ w: 1, cls: 'info', icon: 'group', html: `Friends owe you <b>${esc(money(sb.owed))}</b>`, act: 'data-act="goto" data-tab="plan" data-plan="split"' });
+    const owers = sb.list.filter((p) => p.net > 0);
+    if (owers.length === 1) alerts.push({ w: 1, cls: 'info', icon: 'group', html: `${esc(owers[0].name)} owes you <b>${esc(money(owers[0].net))}</b>`, act: `data-act="open-friend" data-key="${esc(owers[0].key)}"` });
+    else if (owers.length) alerts.push({ w: 1, cls: 'info', icon: 'group', html: `${owers.length} friends owe you <b>${esc(money(sb.owed))}</b>`, act: 'data-act="goto" data-tab="plan" data-plan="split"' });
     alerts.sort((a, b) => b.w - a.w);
     const alertsHtml = alerts.slice(0, 3).map((a) => `<button class="alert ${a.cls}" type="button" ${a.act}>${ic(a.icon)}<p>${a.html}</p>${ic('chevron_right')}</button>`).join('');
 
@@ -893,7 +1077,9 @@
       if (f.mode && t.mode !== f.mode) return false;
       if (q) {
         const c = getCat(t.cat);
-        const hay = `${t.note} ${c.name} ${modeOf(t.mode).name} ${t.amount} ${dateLabel(t.date)}`.toLowerCase();
+        const sp = t.splitId ? state.splits.find((x) => x.id === t.splitId) : null;
+        const mates = sp ? sp.people.map((p) => p.name).join(' ') : '';
+        const hay = `${t.note} ${c.name} ${modeOf(t.mode).name} ${t.amount} ${dateLabel(t.date)} ${mates}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
@@ -1177,13 +1363,13 @@
   }
 
   // ============================================================
-  // Plan: budgets, goals, bills, splits
+  // Plan: budgets, goals, bills, friends (splits)
   // ============================================================
   function renderPlan() {
     const tab = (id, label) => `<button type="button" role="tab" data-act="plan-tab" data-v="${id}" aria-selected="${ui.plan === id}">${label}</button>`;
     const body = { budgets: planBudgets, goals: planGoals, bills: planBills, split: planSplits }[ui.plan]();
     return `${topbarHtml('Plan')}
-      <div class="tabs" role="tablist">${tab('budgets', 'Budgets')}${tab('goals', 'Goals')}${tab('bills', 'Bills')}${tab('split', 'Split')}</div>
+      <div class="tabs" role="tablist">${tab('budgets', 'Budgets')}${tab('goals', 'Goals')}${tab('bills', 'Bills')}${tab('split', 'Friends')}</div>
       ${body}`;
   }
   function planBudgets() {
@@ -1254,29 +1440,48 @@
       <section class="card flush"><div class="list">${sorted.map(billRow).join('')}</div></section>`;
   }
   function planSplits() {
-    if (!state.splits.length) {
-      return `<section class="card">${emptyState('group', 'No shared expenses', 'Split a dinner, trip or rent with friends and keep track of who has paid you back.', `<button class="btn btn-filled" type="button" data-act="add-split">${ic('add')}New split</button>`)}</section>`;
+    const friends = [...friendLedger().values()];
+    if (!state.splits.length && !friends.length) {
+      return `<section class="card">${emptyState('group', 'No friends here yet', 'Paid for a friend? Add the expense and pick them under “Split with friends”. Kharcha keeps a running total for each friend and can send them a WhatsApp reminder.', `<button class="btn btn-filled" type="button" data-act="add-with">${ic('add')}Add a shared expense</button>`)}</section>`;
     }
     const bal = splitBalances();
-    const people = bal.list.length ? `<section class="card flush">
-        <div class="card-head"><h2>Balances</h2></div>
-        <div class="list">${bal.list.map((p) => `<div class="li"><span class="avatar" style="--h:${hueOf(p.name)}">${initial(p.name)}</span><span class="li-main"><span class="li-title">${esc(p.name)}</span><span class="li-sub">${p.net > 0 ? 'owes you' : 'you owe'}</span></span><span class="amt ${p.net > 0 ? 'in' : ''}">${esc(money(Math.abs(p.net)))}</span></div>`).join('')}</div>
-      </section>` : `<section class="card">${emptyState('task_alt', 'All settled up', 'Nobody owes anybody right now.')}</section>`;
-    const list = [...state.splits].sort((a, b) => b.date.localeCompare(a.date)).map((s) => {
-      const mine = s.paidBy === 'me';
-      const rows = mine
-        ? s.people.map((p, i) => `<div class="person-row"><span class="avatar" style="--h:${hueOf(p.name)}">${initial(p.name)}</span><span class="li-main"><span class="li-title">${esc(p.name)}</span><span class="li-sub">${esc(money(p.share))}</span></span>
-            <button class="chip" type="button" data-act="settle" data-id="${esc(s.id)}" data-i="${i}" aria-pressed="${p.settled}">${p.settled ? ic('check') + 'Paid back' : 'Mark paid'}</button></div>`).join('')
-        : `<div class="person-row"><span class="avatar" style="--h:${hueOf(s.paidBy)}">${initial(s.paidBy)}</span><span class="li-main"><span class="li-title">You owe ${esc(s.paidBy)}</span><span class="li-sub">${esc(money(s.myShare))}</span></span>
-            <button class="chip" type="button" data-act="settle" data-id="${esc(s.id)}" data-i="me" aria-pressed="${s.iSettled}">${s.iSettled ? ic('check') + 'Settled' : 'Mark settled'}</button></div>`;
-      return `<section class="card">
-        <div class="goal-top"><span class="cat-ico" style="--h:268">${ic('group')}</span><span class="li-main"><span class="li-title">${esc(s.title)}</span><span class="li-sub">${esc(money(s.total))} · paid by ${mine ? 'you' : esc(s.paidBy)} · ${esc(dateLabel(s.date))}</span></span>
-          <button class="icon-btn sm" type="button" data-act="edit-split" data-id="${esc(s.id)}" aria-label="Edit ${esc(s.title)}">${ic('edit')}</button></div>
-        <div class="people">${rows}</div>
+    const rank = (f) => (f.net > 0.009 ? 0 : f.net < -0.009 ? 1 : 2);
+    friends.sort((a, b) => rank(a) - rank(b) || Math.abs(b.net) - Math.abs(a.net) || b.last.localeCompare(a.last) || a.name.localeCompare(b.name));
+    const friendsHtml = `<section class="card flush">
+        <div class="card-head"><h2>Friends</h2><button class="btn btn-text" type="button" data-act="add-friend">${ic('person_add')}Add friend</button></div>
+        ${friends.length ? `<div class="list">${friends.map(friendRow).join('')}</div>` : ''}
       </section>`;
-    }).join('');
-    const tiles = `<div class="tiles"><div class="tile"><span>You’re owed</span><b>${esc(money(bal.owed))}</b></div><div class="tile"><span>You owe</span><b>${esc(money(bal.owe))}</b></div></div>`;
-    return `<div class="layout"><div class="main-col">${slot(list, 3)}</div><div class="side-col">${slot(tiles, 1)}${slot(people, 2)}</div></div>`;
+    const sorted = [...state.splits].sort((a, b) => b.date.localeCompare(a.date));
+    const shown = ui.allSplits ? sorted : sorted.slice(0, 12);
+    const list = sorted.length ? `<div class="split-cards"><h2 class="section-title">Shared expenses</h2>${shown.map(splitCard).join('')}
+      ${shown.length < sorted.length ? `<button class="btn btn-outline" type="button" data-act="all-splits">Show all ${sorted.length}</button>` : ''}</div>` : '';
+    const tiles = `<div class="tiles"><div class="tile"><span>Friends owe you</span><b>${esc(money(bal.owed))}</b></div><div class="tile"><span>You owe friends</span><b>${esc(money(bal.owe))}</b></div></div>`;
+    return `<div class="layout"><div class="main-col">${slot(list, 3)}</div><div class="side-col">${slot(tiles, 1)}${slot(friendsHtml, 2)}</div></div>`;
+  }
+  function friendRow(f) {
+    const open = f.items.filter((it) => it.left > 0 && it.dir === Math.sign(f.net)).length;
+    const sub = f.net > 0.009 ? `owes you${open ? ` · ${plural(open, 'item')}` : ''}` : f.net < -0.009 ? 'you owe' : 'settled up';
+    return `<div class="li clickable" role="button" tabindex="0" data-act="open-friend" data-key="${esc(f.key)}">
+      <span class="avatar" style="--h:${hueOf(f.key)}">${initial(f.name)}</span>
+      <span class="li-main"><span class="li-title">${esc(f.name)}</span><span class="li-sub">${esc(sub)}</span></span>
+      ${Math.abs(f.net) > 0.009 ? `<span class="amt ${f.net > 0 ? 'in' : ''}">${esc(money(Math.abs(f.net)))}</span>` : ''}
+      ${f.net > 0.009 ? `<button class="icon-btn sm wa-btn" type="button" data-act="wa-request" data-key="${esc(f.key)}" aria-label="Ask ${esc(f.name)} on WhatsApp">${ic('chat')}</button>` : ''}
+    </div>`;
+  }
+  function splitCard(s) {
+    const mine = s.paidBy === 'me';
+    const leftNote = (left, share) => (left > 0 && left < share ? ` · ${money(left)} left` : '');
+    const rows = mine
+      ? s.people.map((p, i) => `<div class="person-row"><span class="avatar" style="--h:${hueOf(fkey(p.name))}">${initial(p.name)}</span><span class="li-main"><span class="li-title">${esc(p.name)}</span><span class="li-sub">${esc(money(p.share) + leftNote(shareLeft(p), p.share))}</span></span>
+          ${p.share > 0 ? `<button class="chip" type="button" data-act="settle" data-id="${esc(s.id)}" data-i="${i}" aria-pressed="${p.settled}">${p.settled ? ic('check') + 'Paid back' : 'Mark paid'}</button>` : ''}</div>`).join('')
+      : s.myShare > 0 ? `<div class="person-row"><span class="avatar" style="--h:${hueOf(fkey(s.paidBy))}">${initial(s.paidBy)}</span><span class="li-main"><span class="li-title">You owe ${esc(s.paidBy)}</span><span class="li-sub">${esc(money(s.myShare) + leftNote(myLeft(s), s.myShare))}</span></span>
+          <button class="chip" type="button" data-act="settle" data-id="${esc(s.id)}" data-i="me" aria-pressed="${s.iSettled}">${s.iSettled ? ic('check') + 'Settled' : 'Mark settled'}</button></div>` : '';
+    const forWhom = mine && !(s.myShare > 0) ? ' · for them' : '';
+    return `<section class="card">
+      <div class="goal-top"><span class="cat-ico" style="--h:268">${ic('group')}</span><span class="li-main"><span class="li-title">${esc(s.title)}</span><span class="li-sub">${esc(money(s.total))} · paid by ${mine ? 'you' : esc(s.paidBy)}${forWhom} · ${esc(dateLabel(s.date))}</span></span>
+        <button class="icon-btn sm" type="button" data-act="edit-split" data-id="${esc(s.id)}" aria-label="Edit ${esc(s.title)}">${ic('edit')}</button></div>
+      ${rows ? `<div class="people">${rows}</div>` : ''}
+    </section>`;
   }
 
   // ============================================================
@@ -1748,9 +1953,12 @@
     sheets.push(sheet);
     document.body.style.overflow = 'hidden';
     $('#fab').hidden = true;
-    if (!framed) { try { history.pushState({ kharchaSheet: sheets.length }, ''); sheet.pushed = true; } catch { /* no history */ } }
+    if (!framed && !CAP) { try { history.pushState({ kharchaSheet: sheets.length }, ''); sheet.pushed = true; } catch { /* no history */ } }
     if (onMount) onMount(el, sheet);
-    setTimeout(() => { const first = $('.sheet-head [data-sheet-close]', el); if (first && !el.contains(document.activeElement)) first.focus({ preventScroll: true }); }, 30);
+    // Move keyboard focus into the sheet on computers; on touch screens it would only show a stray focus ring.
+    if (window.matchMedia('(pointer: fine)').matches) {
+      setTimeout(() => { const first = $('.sheet-head [data-sheet-close]', el); if (first && !el.contains(document.activeElement)) first.focus({ preventScroll: true }); }, 30);
+    }
     return sheet;
   }
   function closeSheet(sheet, fromPop = false) {
@@ -1842,9 +2050,13 @@
       mode: tx ? tx.mode : opts.mode || lastMode,
       date: tx ? tx.date : opts.date || todayStr(),
       note: tx ? tx.note : opts.note || '',
+      // Friends you paid for along with yourself (new expenses only), and how the bill divides.
+      friends: tx ? [] : (opts.friends || []).slice(),
+      how: 'equal',
     };
     if (!d.cat || !allCats(d.type).some((c) => c.id === d.cat)) d.cat = allCats(d.type)[0].id;
     const title = tx ? 'Edit entry' : d.type === 'income' ? 'Add income' : 'Add expense';
+    const linked = tx && tx.splitId ? state.splits.find((x) => x.id === tx.splitId) : null;
     const keys = ['7', '8', '9', '÷', '4', '5', '6', '×', '1', '2', '3', '−', '.', '0', 'del', '+'];
     const keyHtml = keys.map((k) => `<button class="key ${'+−×÷'.includes(k) ? 'op' : ''}" type="button" data-k="${k}" aria-label="${k === 'del' ? 'Backspace' : k}">${k === 'del' ? ic('backspace') : k}</button>`).join('');
     openSheet({
@@ -1858,11 +2070,13 @@
         </div>
         <div class="amount-box"><div class="amount-line"><div class="amount-display" id="amt-disp" aria-live="polite"></div></div><div class="amount-eval" id="amt-eval"></div></div>
         <div><div class="section-title" style="padding:0 0 4px">Category</div><div class="cat-grid" id="cat-grid" role="group" aria-label="Category"></div></div>
+        <div id="tx-split" class="tx-split"></div>
         <div class="row2">
           <label class="field"><span>Date</span><input type="date" id="tx-date" value="${d.date}" max="${addDays(todayStr(), 366)}"></label>
           <label class="field"><span id="mode-label">Paid with</span><select id="tx-mode">${MODES.map((m) => `<option value="${m.id}" ${m.id === d.mode ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}</select>${ic('arrow_drop_down', 'select-ico')}</label>
         </div>
-        <label class="field"><span>Note</span><input id="tx-note" maxlength="80" autocomplete="off" placeholder="e.g. Lunch with team" value="${esc(d.note)}"></label>`,
+        <label class="field"><span>Note</span><input id="tx-note" maxlength="80" autocomplete="off" placeholder="e.g. Lunch with team" value="${esc(d.note)}"></label>
+        ${linked ? `<div class="storage-note">${ic('group')}<span>Your share of “${esc(linked.title)}” (${esc(money(linked.total))} with ${esc(namesList(linked.people.map((p) => p.name)))}). Changing this entry doesn’t change what anyone owes.</span><button class="btn btn-text" type="button" id="tx-edit-split">Edit split</button></div>` : ''}`,
       foot: `<div class="keypad" id="keypad">${keyHtml}<button class="key save" type="button" id="tx-save">${ic('check')}Save</button></div>`,
       onMount(el, sh) {
         const disp = $('#amt-disp', el), evalEl = $('#amt-eval', el);
@@ -1873,6 +2087,42 @@
           const sel = $(`.cat-opt[aria-pressed="true"]`, el);
           if (sel) sel.scrollIntoView({ block: 'nearest', inline: 'center' });
           $('h2', el).textContent = tx ? 'Edit entry' : d.type === 'income' ? 'Add income' : 'Add expense';
+          drawSplit();
+        };
+        // "Split with friends": pick who you paid for; your part is logged, theirs goes on their tab.
+        const drawSplit = () => {
+          const box = $('#tx-split', el);
+          box.hidden = !!tx || d.type !== 'expense';
+          if (box.hidden) { box.innerHTML = ''; return; }
+          const picked = (n) => d.friends.some((x) => fkey(x) === fkey(n));
+          const known = [...friendLedger().values()].sort((a, b) => b.last.localeCompare(a.last) || a.name.localeCompare(b.name)).map((f) => f.name);
+          const names = [...d.friends, ...known.filter((n) => !picked(n)).slice(0, 10)];
+          const n = d.friends.length;
+          box.innerHTML = `<div class="section-title" style="padding:0 0 6px">Split with friends <span class="faint">· optional</span></div>
+            <div class="chip-row">${names.map((nm) => `<button class="chip" type="button" data-friend="${esc(nm)}" aria-pressed="${picked(nm)}">${picked(nm) ? ic('check') : ''}${esc(nm)}</button>`).join('')}
+              <button class="chip" type="button" id="tx-addfriend">${ic('person_add')}${names.length ? 'Someone else' : 'Add a friend'}</button></div>
+            ${n ? `<div class="seg" role="group" aria-label="How to split">
+                <button type="button" data-how="equal" aria-pressed="${d.how === 'equal'}">${ic('check')}Split equally</button>
+                <button type="button" data-how="others" aria-pressed="${d.how === 'others'}">${ic('check')}Paid for ${n === 1 ? 'them' : 'all of them'}</button></div>
+              <p class="hint" id="tx-split-sum" aria-live="polite"></p>` : ''}`;
+          drawSplitSum();
+        };
+        const drawSplitSum = () => {
+          const out = $('#tx-split-sum', el);
+          if (!out) return;
+          const r = safeEval(d.expr);
+          const total = r.ok ? round2(r.value) : 0;
+          const who = namesList(d.friends), owes = d.friends.length === 1 ? 'owes' : 'owe';
+          if (!(total > 0)) {
+            out.textContent = d.how === 'equal' ? `Enter the full amount you paid. It’s shared by ${d.friends.length + 1} people.` : `Enter the amount you paid. ${who} ${owes} you all of it.`;
+            return;
+          }
+          const shares = divideBill(total, d.friends, 'me', d.how);
+          const theirs = round2(total - shares[0]);
+          const each = d.friends.length > 1 ? ` (${esc(money(shares[d.friends.length]))} each)` : '';
+          out.innerHTML = d.how === 'equal'
+            ? `<b>${esc(money(shares[0]))}</b> is your spending · ${esc(who)} ${owes} you <b>${esc(money(theirs))}</b>${each}`
+            : `${esc(who)} ${owes} you <b>${esc(money(theirs))}</b>${each} · nothing is added to your spending`;
         };
         const drawAmt = () => {
           disp.classList.toggle('placeholder', !d.expr);
@@ -1880,6 +2130,7 @@
           const hasOp = /[+×÷]|.−/.test(d.expr);
           const r = safeEval(d.expr);
           evalEl.textContent = hasOp && r.ok ? `= ${money(r.value)}` : '';
+          drawSplitSum();
         };
         const press = (k) => {
           const e = d.expr, last = e.slice(-1);
@@ -1902,6 +2153,17 @@
           if (b.dataset.type && b.dataset.type !== d.type) { d.type = b.dataset.type; d.cat = allCats(d.type)[0].id; drawType(); }
           else if (b.dataset.cat) { d.cat = b.dataset.cat; $$('.cat-opt', el).forEach((x) => x.setAttribute('aria-pressed', String(x === b))); }
           else if (b.dataset.k) press(b.dataset.k);
+          else if (b.dataset.friend) {
+            const nm = b.dataset.friend;
+            d.friends = d.friends.some((x) => fkey(x) === fkey(nm)) ? d.friends.filter((x) => fkey(x) !== fkey(nm)) : [...d.friends, nm];
+            drawSplit();
+          } else if (b.dataset.how) { d.how = b.dataset.how; drawSplit(); }
+          else if (b.id === 'tx-addfriend') {
+            askFriendName().then((nm) => {
+              if (nm && !d.friends.some((x) => fkey(x) === fkey(nm))) d.friends.push(nm);
+              drawSplit();
+            });
+          } else if (b.id === 'tx-edit-split') { sh.close(); openSplitSheet({ split: linked }); }
           else if (b.id === 'tx-save') save();
           else if (b.id === 'tx-delete') del();
         });
@@ -1931,18 +2193,25 @@
             ...(session.user ? { by: (tx && tx.by) || session.user.uid } : {}),
           };
           lastMode = rec.mode;
+          if (!tx && rec.type === 'expense' && d.friends.length) { saveShared(rec); return; }
           const fresh = commit(() => upsert(state.txns, rec));
           sh.close();
-          let msg = tx ? 'Changes saved.' : `Added ${money(amount)} · ${getCat(rec.cat).name}.`;
-          if (rec.type === 'expense' && rec.date.startsWith(thisMonth())) {
-            const lim = state.budgets.cats[rec.cat];
-            if (lim) {
-              const spent = sum(txIn(thisMonth(), 'expense').filter((t) => t.cat === rec.cat), (t) => t.amount);
-              if (spent > lim) msg += ` ${getCat(rec.cat).name} is over budget by ${money(spent - lim, { whole: true })}.`;
-              else if (spent >= 0.8 * lim) msg += ` ${pct(spent / lim)} of ${getCat(rec.cat).short} budget used.`;
-            }
-          }
-          toast(msg + freshNote(fresh));
+          toast((tx ? 'Changes saved.' : `Added ${money(amount)} · ${getCat(rec.cat).name}.`) + budgetNote(rec) + freshNote(fresh));
+        }
+        // You paid the whole bill: your share becomes the expense, the rest goes on your friends' tabs.
+        function saveShared(rec) {
+          const names = d.friends.map((x) => x.trim().slice(0, 30));
+          const shares = divideBill(rec.amount, names, 'me', d.how);
+          const split = {
+            id: uid(), title: (rec.note || getCat(rec.cat).name).slice(0, 50), date: rec.date, total: rec.amount, paidBy: 'me', myShare: shares[0], iSettled: false,
+            people: names.map((name, i) => ({ name, share: shares[i + 1], settled: false })),
+          };
+          const txn = shares[0] > 0 ? { ...rec, amount: shares[0], splitId: split.id } : null;
+          if (txn) split.txnId = txn.id;
+          const fresh = commit(() => { state.splits.push(split); if (txn) state.txns.push(txn); });
+          sh.close();
+          const owe = `${namesList(names)} ${names.length === 1 ? 'owes' : 'owe'} you ${money(round2(rec.amount - shares[0]))}.`;
+          toast((txn ? `Added ${money(txn.amount)} · ${getCat(txn.cat).name}. ${owe}` : `${owe} Nothing added to your spending.`) + (txn ? budgetNote(txn) : '') + freshNote(fresh));
         }
         function del() {
           const snapshot = { ...tx };
@@ -1952,6 +2221,17 @@
         }
       },
     });
+  }
+
+  // After logging an expense: a short note when its category is near or over budget.
+  function budgetNote(rec) {
+    if (rec.type !== 'expense' || !rec.date.startsWith(thisMonth())) return '';
+    const lim = state.budgets.cats[rec.cat];
+    if (!lim) return '';
+    const spent = sum(txIn(thisMonth(), 'expense').filter((t) => t.cat === rec.cat), (t) => t.amount);
+    if (spent > lim) return ` ${getCat(rec.cat).name} is over budget by ${money(spent - lim, { whole: true })}.`;
+    if (spent >= 0.8 * lim) return ` ${pct(spent / lim)} of ${getCat(rec.cat).short} budget used.`;
+    return '';
   }
 
   // ============================================================
@@ -2116,11 +2396,14 @@
   // Splits
   // ============================================================
   function openSplitSheet({ split, preset } = {}) {
-    const s = split ? JSON.parse(JSON.stringify(split)) : { id: uid(), title: '', date: todayStr(), total: '', paidBy: 'me', myShare: 0, iSettled: false, people: [{ name: '', share: 0, settled: false }], ...(preset || {}) };
-    const m = { equal: true, addExpense: !split, cat: 'food' };
+    const s = split ? JSON.parse(JSON.stringify(split)) : { id: uid(), title: '', date: todayStr(), total: '', paidBy: 'me', myShare: 0, iSettled: false, people: [{ name: '', share: 0, settled: false }], ...JSON.parse(JSON.stringify(preset || {})) };
+    // how: 'equal' (everyone the same), 'others' (the payer isn't part of it), 'custom' (typed shares).
+    const m = { how: 'equal', addExpense: !split, cat: 'food' };
     if (split) {
-      const shares = [s.myShare, ...s.people.map((p) => p.share)];
-      m.equal = shares.every((x) => Math.abs(x - shares[0]) < 0.02);
+      const all = [s.myShare, ...s.people.map((p) => p.share)];
+      const same = (arr) => arr.every((x) => Math.abs(x - arr[0]) < 0.02);
+      const payer = s.paidBy === 'me' ? 0 : s.people.findIndex((p) => p.name === s.paidBy) + 1;
+      m.how = same(all) ? 'equal' : all[payer] < 0.005 && same(all.filter((_, i) => i !== payer)) ? 'others' : 'custom';
     }
     const sheet = openSheet({
       title: split ? 'Edit split' : 'Split an expense',
@@ -2135,7 +2418,7 @@
           s.date = ($('#sp-date', el) || {}).value ?? s.date;
           s.paidBy = ($('#sp-paid', el) || {}).value ?? s.paidBy;
           $$('[data-pname]', el).forEach((i) => { s.people[Number(i.dataset.pname)].name = i.value; });
-          if (!m.equal) {
+          if (m.how === 'custom') {
             $$('[data-pshare]', el).forEach((i) => { s.people[Number(i.dataset.pshare)].share = num(i.value); });
             const me = $('#sp-myshare', el); if (me) s.myShare = num(me.value);
           }
@@ -2145,8 +2428,10 @@
         const draw = () => {
           const named = s.people.map((p) => p.name.trim()).filter(Boolean);
           if (s.paidBy !== 'me' && !named.includes(s.paidBy)) s.paidBy = 'me';
-          const total = num(s.total), n = s.people.length + 1;
-          const each = total / n;
+          const custom = m.how === 'custom';
+          const quick = [...friendLedger().values()].sort((a, b) => b.last.localeCompare(a.last) || a.name.localeCompare(b.name))
+            .map((f) => f.name).filter((nm) => !named.some((x) => fkey(x) === fkey(nm))).slice(0, 10);
+          const noShareForMe = m.how === 'others' && s.paidBy === 'me';
           form.innerHTML = `
             <label class="field"><span>What was it for?</span><input id="sp-title" maxlength="50" autocomplete="off" placeholder="e.g. Dinner at Toit" value="${esc(s.title)}"></label>
             <div class="row2">
@@ -2154,23 +2439,38 @@
               <label class="field"><span>Date</span><input type="date" id="sp-date" value="${s.date}"></label>
             </div>
             <div class="section-title" style="padding:4px 0 0">People (besides you)</div>
-            <div class="people">${s.people.map((p, i) => `<div class="person-row"><span class="avatar" style="--h:${hueOf(p.name || i)}">${p.name ? initial(p.name) : ic('person', 'xs')}</span>
+            ${quick.length ? `<div class="chip-row">${quick.map((nm) => `<button class="chip" type="button" data-qf="${esc(nm)}">${ic('add')}${esc(nm)}</button>`).join('')}</div>` : ''}
+            <div class="people">${s.people.map((p, i) => `<div class="person-row"><span class="avatar" style="--h:${hueOf(fkey(p.name) || i)}">${p.name.trim() ? initial(p.name) : ic('person', 'xs')}</span>
               <label class="field"><span>Name</span><input data-pname="${i}" maxlength="30" autocomplete="off" value="${esc(p.name)}" placeholder="Friend’s name"></label>
-              ${m.equal ? '' : `<label class="field" style="max-width:120px"><span>Share</span><input data-pshare="${i}" inputmode="decimal" autocomplete="off" value="${p.share || ''}"></label>`}
+              ${custom ? `<label class="field" style="max-width:120px"><span>Share</span><input data-pshare="${i}" inputmode="decimal" autocomplete="off" value="${p.share || ''}"></label>` : ''}
               <button class="icon-btn sm" type="button" data-premove="${i}" aria-label="Remove person" ${s.people.length === 1 ? 'disabled style="opacity:.3"' : ''}>${ic('close')}</button></div>`).join('')}
             </div>
             <button class="btn btn-outline" type="button" id="sp-addp">${ic('person_add')}Add person</button>
             <label class="field"><span>Paid by</span><select id="sp-paid"><option value="me">You</option>${named.map((nm) => `<option value="${esc(nm)}" ${nm === s.paidBy ? 'selected' : ''}>${esc(nm)}</option>`).join('')}</select>${ic('arrow_drop_down', 'select-ico')}</label>
-            <label class="switch-row"><span class="txt">Split equally<small id="sp-each">${m.equal && total > 0 ? `${esc(money(each))} each for ${n} people` : 'Turn off to enter each share'}</small></span><span class="switch"><input type="checkbox" id="sp-equal" ${m.equal ? 'checked' : ''}><i></i></span></label>
-            ${m.equal ? '' : `<label class="field"><span>Your share</span><span class="affix"><b>${esc(cur.symbol)}</b><input id="sp-myshare" inputmode="decimal" autocomplete="off" value="${s.myShare || ''}"></span></label><p class="hint" id="sp-left"></p>`}
-            ${split ? '' : `<label class="switch-row"><span class="txt">Add my share to expenses<small>Logs only your part, not the whole bill</small></span><span class="switch"><input type="checkbox" id="sp-addexp" ${m.addExpense ? 'checked' : ''}><i></i></span></label>
+            <div class="seg" role="group" aria-label="How to split">
+              <button type="button" data-how="equal" aria-pressed="${m.how === 'equal'}">${ic('check')}Equally</button>
+              <button type="button" data-how="others" aria-pressed="${m.how === 'others'}">${ic('check')}Paid for others</button>
+              <button type="button" data-how="custom" aria-pressed="${custom}">${ic('check')}Custom</button></div>
+            <p class="hint" id="sp-each" aria-live="polite"></p>
+            ${custom ? `<label class="field"><span>Your share</span><span class="affix"><b>${esc(cur.symbol)}</b><input id="sp-myshare" inputmode="decimal" autocomplete="off" value="${s.myShare || ''}"></span></label><p class="hint" id="sp-left"></p>` : ''}
+            ${split || noShareForMe ? '' : `<label class="switch-row"><span class="txt">Add my share to expenses<small>Logs only your part, not the whole bill</small></span><span class="switch"><input type="checkbox" id="sp-addexp" ${m.addExpense ? 'checked' : ''}><i></i></span></label>
             ${m.addExpense ? `<label class="field"><span>Category for my share</span><select id="sp-cat">${allCats('expense').map((c) => `<option value="${esc(c.id)}" ${c.id === m.cat ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select>${ic('arrow_drop_down', 'select-ico')}</label>` : ''}`}`;
+          updEach();
           updLeft();
         };
         const updEach = () => {
           const out = $('#sp-each', el);
-          const total = num($('#sp-total', el).value), n = s.people.length + 1;
-          if (out && m.equal) out.textContent = total > 0 ? `${money(total / n)} each for ${n} people` : 'Turn off to enter each share';
+          if (!out) return;
+          const total = num($('#sp-total', el).value);
+          const names = $$('[data-pname]', el).map((i) => i.value.trim()).filter(Boolean);
+          const paidBy = $('#sp-paid', el).value;
+          if (m.how === 'custom') { out.textContent = 'Type each person’s share. They need to add up to the total.'; return; }
+          if (!(total > 0) || !names.length) {
+            out.textContent = m.how === 'equal' ? 'Everyone pays the same.' : 'Whoever paid isn’t part of it. Everyone else shares it equally.';
+            return;
+          }
+          const shares = divideBill(total, names, paidBy, m.how);
+          out.textContent = [`You ${money(shares[0])}`, ...names.map((nm, i) => `${nm} ${money(shares[i + 1])}`)].join(' · ');
         };
         const updPaidBy = () => {
           const sel = $('#sp-paid', el);
@@ -2194,23 +2494,27 @@
             const i = Number(e.target.dataset.pname);
             const av = e.target.closest('.person-row').querySelector('.avatar');
             s.people[i].name = e.target.value;
-            av.style.setProperty('--h', hueOf(e.target.value || i));
+            av.style.setProperty('--h', hueOf(fkey(e.target.value) || i));
             av.innerHTML = e.target.value.trim() ? initial(e.target.value) : ic('person', 'xs');
             updPaidBy();
+            updEach();
           }
         });
         el.addEventListener('change', (e) => {
-          if (['sp-equal', 'sp-addexp'].includes(e.target.id)) {
-            readForm();
-            if (e.target.id === 'sp-equal') m.equal = e.target.checked;
-            draw();
-          }
+          if (['sp-addexp', 'sp-paid'].includes(e.target.id)) { readForm(); draw(); }
         });
         el.addEventListener('click', async (e) => {
           const b = e.target.closest('button');
           if (!b) return;
           if (b.id === 'sp-addp') { readForm(); s.people.push({ name: '', share: 0, settled: false }); draw(); const ins = $$('[data-pname]', el); ins[ins.length - 1].focus(); }
           if (b.dataset.premove !== undefined) { readForm(); s.people.splice(Number(b.dataset.premove), 1); draw(); }
+          if (b.dataset.qf) {
+            readForm();
+            const empty = s.people.find((p) => !p.name.trim());
+            if (empty) empty.name = b.dataset.qf; else s.people.push({ name: b.dataset.qf, share: 0, settled: false });
+            draw();
+          }
+          if (b.dataset.how) { readForm(); m.how = b.dataset.how; draw(); }
           if (b.id === 'sp-save') save();
           if (b.id === 'sp-del') {
             if (!(await confirmDialog('Delete this split?', `“${s.title}” and who-owes-whom for it will be removed. A logged expense for your share stays.`, 'Delete', true))) return;
@@ -2226,29 +2530,41 @@
           const title = s.title.trim(), total = round2(num(s.total));
           if (!title) return bad('#sp-title');
           if (!(total > 0)) return bad('#sp-total');
-          const people = s.people.map((p) => ({ ...p, name: p.name.trim().slice(0, 30) })).filter((p) => p.name);
+          const people = s.people.map((p) => ({ ...p, name: p.name.trim().replace(/\s+/g, ' ').slice(0, 30) })).filter((p) => p.name);
           if (!people.length) return bad('[data-pname="0"]');
+          const clash = s.people.findIndex((p) => ['me', 'you'].includes(fkey(p.name)));
+          if (clash >= 0) { toast('Use your friend’s name. You’re already counted.'); return bad(`[data-pname="${clash}"]`); }
+          const paidBy = s.paidBy !== 'me' && people.some((p) => p.name === s.paidBy) ? s.paidBy : 'me';
           let myShare = s.myShare;
-          if (m.equal) {
-            const each = round2(total / (people.length + 1));
-            people.forEach((p) => { p.share = each; });
-            myShare = round2(total - each * people.length);
+          if (m.how !== 'custom') {
+            const shares = divideBill(total, people.map((p) => p.name), paidBy, m.how);
+            myShare = shares[0];
+            people.forEach((p, i) => { p.share = shares[i + 1]; });
           } else if (Math.abs(total - myShare - sum(people, (p) => p.share)) > 0.01) {
             toast('Shares need to add up to the total.');
             return;
           }
-          const rec = { ...s, title: title.slice(0, 50), total, myShare, people, date: isDateStr(s.date) ? s.date : todayStr() };
-          if (rec.paidBy !== 'me' && !people.some((p) => p.name === rec.paidBy)) rec.paidBy = 'me';
-          if (split && split.paidBy !== rec.paidBy) { people.forEach((p) => { p.settled = false; }); rec.iSettled = false; }
-          if (rec.paidBy !== 'me') people.forEach((p) => { if (p.name === rec.paidBy) p.settled = true; });
-          let txn = null;
+          const rec = { ...s, title: title.slice(0, 50), total, myShare, paidBy, people, date: isDateStr(s.date) ? s.date : todayStr() };
+          if (split && split.paidBy !== rec.paidBy) { people.forEach((p) => { p.settled = false; delete p.paid; }); rec.iSettled = false; delete rec.myPaid; }
+          if (rec.paidBy !== 'me') people.forEach((p) => { if (p.name === rec.paidBy) { p.settled = true; delete p.paid; } });
+          let txn = null, linked = null, dropId = null;
           if (!split && m.addExpense && myShare > 0) {
-            txn = { id: uid(), type: 'expense', amount: myShare, cat: m.cat, mode: rec.paidBy === 'me' ? lastMode : 'upi', date: rec.date, note: `Split: ${rec.title}`, ts: Date.now(), splitId: rec.id, ...(session.user ? { by: session.user.uid } : {}) };
+            txn = { id: uid(), type: 'expense', amount: myShare, cat: m.cat, mode: rec.paidBy === 'me' ? lastMode : 'upi', date: rec.date, note: rec.title, ts: Date.now(), splitId: rec.id, ...(session.user ? { by: session.user.uid } : {}) };
             rec.txnId = txn.id;
           }
-          const fresh = commit(() => { upsert(state.splits, rec); if (txn) state.txns.push(txn); });
+          // Keep the expense logged for your share in step with the split.
+          const old = split && rec.txnId ? state.txns.find((t) => t.id === rec.txnId) : null;
+          if (old && myShare > 0) linked = { ...old, amount: myShare, date: rec.date };
+          else if (old) { dropId = old.id; delete rec.txnId; }
+          const fresh = commit(() => {
+            upsert(state.splits, rec);
+            if (txn) state.txns.push(txn);
+            if (linked) upsert(state.txns, linked);
+            if (dropId) state.txns = state.txns.filter((t) => t.id !== dropId);
+          });
           sheet.close();
-          toast((split ? 'Split updated.' : `Split saved${txn ? ` · your ${money(myShare)} logged` : ''}.`) + freshNote(fresh));
+          const sync = linked && linked.amount !== old.amount ? ` Your expense is now ${money(linked.amount)}.` : dropId ? ' Your share is now zero, so its expense was removed.' : '';
+          toast((split ? `Split updated.${sync}` : `Split saved${txn ? ` · your ${money(myShare)} logged` : ''}.`) + freshNote(fresh));
         }
       },
     });
@@ -2257,9 +2573,274 @@
     const s = state.splits.find((x) => x.id === id);
     if (!s) return;
     const rec = JSON.parse(JSON.stringify(s));
-    if (i === 'me') rec.iSettled = !rec.iSettled;
-    else rec.people[Number(i)].settled = !rec.people[Number(i)].settled;
+    if (i === 'me') { rec.iSettled = !rec.iSettled; delete rec.myPaid; }
+    else { const p = rec.people[Number(i)]; p.settled = !p.settled; delete p.paid; }
     commit(() => upsert(state.splits, rec), { keepSample: true });
+  }
+
+  // ============================================================
+  // Friends: running totals, payments back, WhatsApp reminders
+  // ============================================================
+  const knownFriendNames = () => [...friendLedger().values()].map((f) => f.name);
+  // A quick "who?" prompt. Returns the name (matching an existing friend's spelling) or ''.
+  async function askFriendName() {
+    const known = knownFriendNames();
+    let name = '';
+    const v = await openDialog({
+      title: 'Add a friend',
+      html: `<label class="field"><span>Name</span><input id="fr-name" maxlength="30" autocomplete="off" list="fr-known" placeholder="e.g. Bhavya"></label>
+        <datalist id="fr-known">${known.map((n) => `<option value="${esc(n)}"></option>`).join('')}</datalist>`,
+      actions: [{ label: 'Cancel', value: null }, { label: 'Add', value: 'ok', kind: 'filled' }],
+      onAction(val, root) {
+        if (val !== 'ok') return true;
+        const inp = $('#fr-name', root);
+        name = inp.value.trim().replace(/\s+/g, ' ').slice(0, 30);
+        if (!name || ['me', 'you'].includes(fkey(name))) { inp.closest('.field').classList.add('invalid'); inp.focus(); return false; }
+        return true;
+      },
+    });
+    if (v !== 'ok') return '';
+    return known.find((n) => fkey(n) === fkey(name)) || name;
+  }
+  const canPickContact = () => { try { return 'contacts' in navigator && 'ContactsManager' in window; } catch { return false; } };
+  const phoneLabel = (d) => (!d ? '' : d.length === 12 && d.startsWith('91') ? `+91 ${d.slice(2, 7)} ${d.slice(7)}` : `+${d}`);
+  // Add or edit a friend's name and WhatsApp number. Resolves to { name, phone }, the value of
+  // one of the `extra` actions, or null when cancelled.
+  function friendDialog(f, { title, askName = true, okLabel = 'Save', extra = [] } = {}) {
+    let out = null;
+    const p = openDialog({
+      title: title || (f ? `Edit ${f.name}` : 'Add a friend'),
+      html: `${askName ? `<label class="field"><span>Name</span><input id="fr-name" maxlength="30" autocomplete="off" value="${esc(f ? f.name : '')}" placeholder="e.g. Bhavya"></label>` : ''}
+        <label class="field"><span>WhatsApp number${askName ? ' (optional)' : ''}</span><input id="fr-phone" type="tel" inputmode="tel" autocomplete="off" value="${esc(phoneLabel(f && f.phone))}" placeholder="${cur.code === 'INR' ? 'e.g. 98765 43210' : 'With country code, e.g. +1 415 555 0100'}"></label>
+        ${canPickContact() ? `<button class="btn btn-text" type="button" id="fr-pick" style="align-self:flex-start">${ic('contacts')}Choose from contacts</button>` : ''}
+        <p class="hint">Used to send payment reminders on WhatsApp.${cur.code === 'INR' ? ' Numbers without a country code are taken as Indian (+91).' : ''}</p>`,
+      actions: [...extra, { label: 'Cancel', value: null }, { label: okLabel, value: 'ok', kind: 'filled' }],
+      onAction(val, root) {
+        if (val !== 'ok') return true;
+        const nameIn = $('#fr-name', root), phoneIn = $('#fr-phone', root);
+        const name = nameIn ? nameIn.value.trim().replace(/\s+/g, ' ').slice(0, 30) : f.name;
+        const other = friendLedger().get(fkey(name));
+        if (!name || ['me', 'you'].includes(fkey(name)) || (other && (!f || other.key !== f.key))) {
+          nameIn.closest('.field').classList.add('invalid');
+          if (other) toast(`You already have a friend called ${other.name}.`);
+          nameIn.focus();
+          return false;
+        }
+        const raw = phoneIn.value.trim();
+        const phone = phoneFromInput(raw);
+        if ((raw || !askName) && !phone) {
+          phoneIn.closest('.field').classList.add('invalid');
+          toast(cur.code === 'INR' ? 'Enter a 10-digit mobile number.' : 'Enter the number with its country code, like +1 415 555 0100.');
+          phoneIn.focus();
+          return false;
+        }
+        out = { name, phone };
+        return true;
+      },
+    });
+    const root = $('#dialog-root').lastElementChild;
+    const pick = $('#fr-pick', root);
+    if (pick) {
+      pick.addEventListener('click', async () => {
+        try {
+          const [c] = await navigator.contacts.select(['name', 'tel'], { multiple: false });
+          if (!c) return;
+          if (c.tel && c.tel[0]) $('#fr-phone', root).value = c.tel[0];
+          const nameIn = $('#fr-name', root);
+          if (nameIn && !nameIn.value.trim() && c.name && c.name[0]) nameIn.value = c.name[0].slice(0, 30);
+        } catch { /* picker closed or not allowed */ }
+      });
+    }
+    return p.then((v) => (v === 'ok' ? out : v || null));
+  }
+  // Save a friend's name and number. Renaming also renames them in every split.
+  function saveFriend(f, { name, phone }) {
+    const oldKey = f ? f.key : fkey(name);
+    const renamed = f && name !== f.name;
+    return commit(() => {
+      state.friends = state.friends.filter((x) => fkey(x.name) !== oldKey && fkey(x.name) !== fkey(name));
+      state.friends.push({ name, phone });
+      if (!renamed) return;
+      state.splits = state.splits.map((s) => {
+        if (fkey(s.paidBy) !== oldKey && !s.people.some((p) => fkey(p.name) === oldKey)) return s;
+        return { ...s, paidBy: fkey(s.paidBy) === oldKey ? name : s.paidBy, people: s.people.map((p) => (fkey(p.name) === oldKey ? { ...p, name } : p)) };
+      });
+    }, { keepSample: !!f });
+  }
+  async function addFriend() {
+    const res = await friendDialog(null);
+    if (!res) return;
+    const fresh = saveFriend(null, res);
+    toast(`Added ${res.name}. Pick them under “Split with friends” when you add an expense.${freshNote(fresh)}`);
+  }
+
+  function openFriendSheet(key) {
+    const first = friendLedger().get(key);
+    if (!first) return;
+    openSheet({
+      title: first.name,
+      cls: 'friend-sheet',
+      action: `<button class="icon-btn" type="button" id="fr-edit" aria-label="Edit name and number">${ic('edit')}</button>`,
+      html: '<div id="fr-body" class="fr-body"></div>',
+      onMount(el, sh) {
+        const draw = () => {
+          const f = friendLedger().get(key);
+          if (!f) { sh.close(); return; }
+          $('.sheet-head h2', el).textContent = f.name;
+          const net = f.net, owesMe = net > 0.009, iOwe = net < -0.009;
+          const open = f.items.filter((it) => it.left > 0).reverse();
+          const done = f.items.filter((it) => !(it.left > 0)).reverse().slice(0, 20);
+          const itemRow = (it) => {
+            const s = it.s;
+            const t = s.txnId ? state.txns.find((x) => x.id === s.txnId) : null;
+            const c = t ? getCat(t.cat) : null;
+            const sub = [dateLabel(s.date), s.paidBy === 'me' ? (s.myShare > 0 ? `you paid ${money(s.total)}` : 'you paid for them') : `${f.name} paid ${money(s.total)}`].join(' · ');
+            const part = it.left > 0 && it.left < it.share;
+            const end = it.left > 0
+              ? `<span class="amt ${it.dir > 0 ? 'in' : ''}">${it.dir > 0 ? '' : '−'}${esc(money(it.left))}</span><small class="faint">${part ? `of ${esc(money(it.share))}` : it.dir > 0 ? 'owes you' : 'you owe'}</small>`
+              : `<span class="amt faint">${esc(money(it.share))}</span><small class="faint">${it.dir > 0 ? 'paid back' : 'you paid'}</small>`;
+            return `<button class="li" type="button" data-act="edit-split" data-id="${esc(s.id)}">${c ? catIco(c, 'sm') : `<span class="cat-ico sm" style="--h:268">${ic('group')}</span>`}
+              <span class="li-main"><span class="li-title">${esc(s.title)}</span><span class="li-sub">${esc(sub)}</span></span><span class="li-end">${end}</span></button>`;
+          };
+          $('#fr-body', el).innerHTML = `
+            <section class="card friend-hero">
+              <div class="friend-top"><span class="avatar lg" style="--h:${hueOf(f.key)}">${initial(f.name)}</span>
+                <div class="li-main"><span class="friend-label">${owesMe ? `${esc(f.name)} owes you` : iOwe ? `You owe ${esc(f.name)}` : 'Nobody owes anything'}</span>
+                  <b class="friend-amt ${owesMe ? 'in' : ''}">${owesMe || iOwe ? esc(money(Math.abs(net))) : 'Settled up'}</b></div></div>
+              ${owesMe || iOwe ? `<div class="friend-actions">
+                ${owesMe ? `<button class="btn btn-wa" type="button" data-fr="wa">${ic('chat')}Request on WhatsApp</button>` : ''}
+                <button class="btn btn-tonal" type="button" data-fr="pay">${ic('payments')}${owesMe ? 'Record payment' : `I paid ${esc(f.name)}`}</button></div>` : ''}
+              <p class="hint">${f.phone ? `WhatsApp ${esc(phoneLabel(f.phone))}.` : 'No WhatsApp number yet. Tap the pencil to add one.'}${owesMe && !state.settings.upi && cur.code === 'INR' ? ' Add your UPI ID in Settings and it goes into the request, so they can pay you straight away.' : ''}</p>
+            </section>
+            <div class="friend-adds">
+              <button class="btn btn-outline" type="button" data-fr="add">${ic('add')}I paid</button>
+              <button class="btn btn-outline" type="button" data-fr="they">${ic('add')}${esc(f.name)} paid</button>
+            </div>
+            ${open.length ? `<section class="card flush"><div class="card-head"><h2>Not settled yet</h2></div><div class="list">${open.map(itemRow).join('')}</div></section>` : ''}
+            ${done.length ? `<section class="card flush"><div class="card-head"><h2>Settled</h2></div><div class="list">${done.map(itemRow).join('')}</div></section>` : ''}
+            ${!f.items.length ? `<section class="card">${emptyState('group', 'Nothing with ' + f.name + ' yet', 'When you pay for them, add the expense and pick them under “Split with friends”.')}</section>` : ''}`;
+        };
+        sh.onData = draw;
+        draw();
+        el.addEventListener('click', async (e) => {
+          const b = e.target.closest('button');
+          if (!b) return;
+          const f = friendLedger().get(key);
+          if (!f) return;
+          if (b.id === 'fr-edit') {
+            const res = await friendDialog(f, { extra: !f.items.length ? [{ label: 'Remove', value: 'remove' }] : [] });
+            if (res === 'remove') {
+              commit(() => { state.friends = state.friends.filter((x) => fkey(x.name) !== f.key); }, { keepSample: true });
+              toast(`Removed ${f.name}.`);
+              return;
+            }
+            if (!res) return;
+            key = fkey(res.name);
+            saveFriend(f, res);
+            toast('Saved.');
+          }
+          const act = b.dataset.fr;
+          if (act === 'wa') requestOnWhatsApp(f.key);
+          if (act === 'pay') recordPayment(f.key);
+          if (act === 'add') openTxSheet({ friends: [f.name] });
+          if (act === 'they') openSplitSheet({ preset: { paidBy: f.name, people: [{ name: f.name, share: 0, settled: false }] } });
+        });
+      },
+    });
+  }
+
+  async function recordPayment(key) {
+    const f = friendLedger().get(key);
+    if (!f || Math.abs(f.net) < 0.01) return;
+    const theyPay = f.net > 0, full = Math.abs(f.net);
+    let amt = 0;
+    const v = await openDialog({
+      title: theyPay ? `${f.name} paid you` : `You paid ${f.name}`,
+      html: `<label class="field"><span>Amount</span><span class="affix"><b>${esc(cur.symbol)}</b><input id="pay-amt" inputmode="decimal" autocomplete="off" value="${plainNum(full)}"></span></label>
+        <p class="hint">${theyPay ? `${esc(f.name)} owes you ${esc(money(full))}.` : `You owe ${esc(f.name)} ${esc(money(full))}.`} The full amount settles everything. A smaller amount clears the oldest items first.</p>`,
+      actions: [{ label: 'Cancel', value: null }, { label: 'Record', value: 'ok', kind: 'filled' }],
+      onAction(val, root) {
+        if (val !== 'ok') return true;
+        const inp = $('#pay-amt', root);
+        amt = round2(num(inp.value));
+        if (!(amt > 0) || amt > full + 0.005) { inp.closest('.field').classList.add('invalid'); inp.focus(); return false; }
+        return true;
+      },
+    });
+    if (v !== 'ok') return;
+    settleWith(key, amt);
+  }
+  // Apply a payment between you and a friend. The full balance settles every item both ways;
+  // a part payment pays off their oldest items first (or yours, when you were the one paying).
+  function settleWith(key, amount) {
+    const f = friendLedger().get(key);
+    if (!f) return;
+    const dir = f.net > 0 ? 1 : -1;
+    const full = amount >= Math.abs(f.net) - 0.005;
+    const touched = new Map();
+    const copy = (s) => { if (!touched.has(s.id)) touched.set(s.id, JSON.parse(JSON.stringify(s))); return touched.get(s.id); };
+    const before = [...new Set(f.items.map((it) => it.s))].map((s) => JSON.parse(JSON.stringify(s)));
+    let left = amount;
+    for (const it of f.items) {
+      if (!(it.left > 0) || (!full && it.dir !== dir)) continue;
+      if (!full && left < 0.005) break;
+      const pay = full ? it.left : Math.min(it.left, left);
+      left = round2(left - pay);
+      const r = copy(it.s);
+      if (it.i === 'me') {
+        const paid = round2((r.myPaid || 0) + pay);
+        if (paid >= r.myShare - 0.005) { r.iSettled = true; delete r.myPaid; } else r.myPaid = paid;
+      } else {
+        const p = r.people[it.i];
+        const paid = round2((p.paid || 0) + pay);
+        if (paid >= p.share - 0.005) { p.settled = true; delete p.paid; } else p.paid = paid;
+      }
+    }
+    commit(() => touched.forEach((r) => upsert(state.splits, r)), { keepSample: true });
+    const rest = round2(Math.abs(f.net) - amount);
+    const msg = full ? `All settled with ${f.name}.` : dir > 0 ? `${money(amount)} recorded. ${f.name} still owes you ${money(rest)}.` : `${money(amount)} recorded. You still owe ${f.name} ${money(rest)}.`;
+    toast(msg, { label: 'Undo', run: () => commit(() => before.forEach((s) => upsert(state.splits, s)), { keepSample: true }) });
+  }
+
+  // The reminder message: every open item, oldest first, and the total.
+  function requestText(f) {
+    const open = f.items.filter((it) => it.left > 0);
+    const shown = open.slice(-25);
+    const earlier = round2(sum(open.slice(0, open.length - shown.length), (it) => it.dir * it.left));
+    const line = (it) => {
+      const amt = `${it.dir > 0 ? '' : '−'}${money(it.left)}${it.left < it.share ? ` left of ${money(it.share)}` : ''}`;
+      return `• ${dateLabel(it.s.date)} · ${it.s.title}${it.dir > 0 ? '' : ' (you paid)'}: ${amt}`;
+    };
+    const firstName = f.name.split(' ')[0];
+    const lines = [`Hi ${firstName}! Here’s what’s pending between us:`, ''];
+    if (earlier) lines.push(`• Earlier: ${earlier < 0 ? '−' : ''}${money(Math.abs(earlier))}`);
+    lines.push(...shown.map(line), '', `*Total: ${money(f.net)}*`);
+    if (state.settings.upi) lines.push(`UPI: ${state.settings.upi}`);
+    lines.push('', 'Thanks!');
+    return lines.join('\n');
+  }
+  function openWhatsApp(phone, text) {
+    const url = `https://wa.me/${phone || ''}?text=${encodeURIComponent(text)}`;
+    // In the Android app, leaving the page hands the link to WhatsApp.
+    if (CAP) { location.href = url; return; }
+    const a = document.createElement('a');
+    a.href = url;
+    a.target = '_blank';
+    a.rel = 'noopener';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }
+  async function requestOnWhatsApp(key) {
+    let f = friendLedger().get(key);
+    if (!f || !(f.net > 0.009)) return;
+    if (!f.phone) {
+      // No number yet: save one, or let WhatsApp ask which chat to send it to.
+      const res = await friendDialog(f, { title: `${f.name}’s WhatsApp`, askName: false, okLabel: 'Send', extra: [{ label: 'Choose chat in WhatsApp', value: 'any' }] });
+      if (!res) return;
+      if (res !== 'any') { saveFriend(f, { name: f.name, phone: res.phone }); f = friendLedger().get(key); }
+    }
+    openWhatsApp(f.phone, requestText(f));
   }
 
   // ============================================================
@@ -2270,6 +2851,12 @@
     if (state.sample) return { icon: 'science', text: 'Sample data is showing and isn’t saved. Your first entry starts your own book.' };
     if (store.kind === 'firebase') return { icon: 'cloud_done', text: `Synced to your Google account (${session.user.email}). Sign in on any phone or computer to see the same book.` };
     if (store.kind === 'cloud') return { icon: 'cloud_done', text: 'Saved to your Claude account. Open this page on your phone or computer to see the same book.' };
+    if (store.kind === 'phone') {
+      const when = backupInfo.at ? ` Last backup ${new Date(backupInfo.at).toLocaleTimeString(cur.locale, { hour: 'numeric', minute: '2-digit' })}.` : '';
+      return backupInfo.ok === false
+        ? { icon: 'smartphone', text: 'Saved on this phone, inside the app. The automatic backup to Documents/Kharcha couldn’t be written, so use “Back up data” to keep a copy.' }
+        : { icon: 'smartphone', text: `Saved on this phone, inside the app. A backup copy is kept automatically in Documents/Kharcha.${when}` };
+    }
     if (store.kind === 'device') return { icon: 'smartphone', text: 'Saved in this browser on this device. Use “Back up data” now and then to keep a copy.' };
     return { icon: 'warning', text: 'This browser is blocking storage, so changes last only until you close the page. Back up your data before leaving.' };
   }
@@ -2288,18 +2875,27 @@
           <div class="seg" role="group" aria-label="Theme">${['system', 'light', 'dark'].map((t) => `<button type="button" data-theme-opt="${t}" aria-pressed="${ui.theme === t}">${ic('check')}${t[0].toUpperCase() + t.slice(1)}</button>`).join('')}</div></div>
         <div class="set-group"><h3>Money</h3>
           <label class="field"><span>Currency</span><select id="st-cur">${CURRENCIES.map((c) => `<option value="${c.code}" ${c.code === state.settings.currency ? 'selected' : ''}>${c.code} · ${esc(c.name)}</option>`).join('')}</select>${ic('arrow_drop_down', 'select-ico')}</label>
+          ${cur.code === 'INR' || state.settings.upi ? `<label class="field"><span>Your UPI ID (added to WhatsApp payment requests)</span><input id="st-upi" maxlength="60" autocomplete="off" autocapitalize="none" spellcheck="false" value="${esc(state.settings.upi)}" placeholder="e.g. yourname@okaxis"></label>` : ''}
           <button class="set-item" type="button" data-set="budgets">${ic('savings')}<span class="li-main"><span>Budgets</span><small>${state.budgets.total ? esc(money(state.budgets.total, { whole: true })) + ' a month' : 'Not set'}</small></span>${ic('chevron_right')}</button>
           <button class="set-item" type="button" data-set="cats">${ic('category')}<span class="li-main"><span>Your categories</span><small>${state.customCats.length ? plural(state.customCats.length, 'custom category', 'custom categories') : 'Add your own categories'}</small></span>${ic('chevron_right')}</button></div>
         <div class="set-group"><h3>Your data</h3>
           <button class="set-item" type="button" data-set="csv">${ic('table_view')}<span class="li-main"><span>Export to CSV</span><small>Opens in Excel or Google Sheets</small></span></button>
           <button class="set-item" type="button" data-set="backup">${ic('backup')}<span class="li-main"><span>Back up data</span><small>Save everything as one file</small></span></button>
-          <label class="set-item" style="cursor:pointer">${ic('settings_backup_restore')}<span class="li-main"><span>Restore from backup</span><small>Replaces what’s here with the file’s data</small></span><input type="file" id="st-restore" accept="application/json,.json" hidden></label>
+          <label class="set-item" style="cursor:pointer">${ic('settings_backup_restore')}<span class="li-main"><span>Restore from backup</span><small>Replaces what’s here with the file’s data</small></span><input type="file" id="st-restore" accept="${CAP ? '*/*' : 'application/json,.json'}" hidden></label>
           ${session.book ? '' : `<button class="set-item" type="button" data-set="sample">${ic('science')}<span class="li-main"><span>Show sample data</span><small>Explore with example entries. Nothing is saved.</small></span></button>`}
           ${session.mode !== 'firebase' || !session.book || session.book.owner === session.user.uid ? `<button class="set-item danger" type="button" data-set="wipe">${ic('delete_forever')}<span class="li-main"><span>Delete all data${session.book ? ' in this book' : ''}</span><small>Removes every entry, budget, bill, goal and split${session.book ? ' for everyone in it' : ''}</small></span></button>` : ''}</div>
-        <p class="hint" style="text-align:center">Kharcha · version 1.0</p>`,
+        <p class="hint" style="text-align:center">Kharcha · version 1.1</p>`,
       onMount(el) {
         el.addEventListener('change', async (e) => {
           if (e.target.id === 'st-name') commit(() => { state.settings.name = e.target.value.trim().slice(0, 40); }, { keepSample: true });
+          if (e.target.id === 'st-upi') {
+            const raw = e.target.value.trim(), upi = cleanUpi(raw);
+            const field = e.target.closest('.field');
+            if (raw && !upi) { field.classList.add('invalid'); toast('That doesn’t look like a UPI ID. It looks like yourname@okaxis.'); return; }
+            field.classList.remove('invalid');
+            commit(() => { state.settings.upi = upi; }, { keepSample: true });
+            toast(upi ? 'UPI ID saved. It’s added to payment requests.' : 'UPI ID removed.');
+          }
           if (e.target.id === 'st-cur') {
             commit(() => { state.settings.currency = e.target.value; setCurrency(e.target.value); }, { keepSample: true });
             toast(session.book ? `Everyone in ${session.book.name} now sees amounts in ${e.target.value}.` : `Amounts now show in ${e.target.value}. Existing numbers aren’t converted.`);
@@ -2394,6 +2990,21 @@
   }
 
   async function saveFile(filename, text, mime) {
+    if (CAP) {
+      const FS = nativePlugin('Filesystem');
+      const Share = nativePlugin('Share');
+      if (!FS) { toast('Couldn’t create the file.'); return; }
+      let saved = false;
+      try { await FS.writeFile({ path: `Kharcha/${filename}`, directory: 'DOCUMENTS', encoding: 'utf8', data: text, recursive: true }); saved = true; } catch { /* still offer sharing */ }
+      try {
+        const res = await FS.writeFile({ path: filename, directory: 'CACHE', encoding: 'utf8', data: text });
+        toast(saved ? `Saved to Documents/Kharcha/${filename}.` : `${filename} is ready to share.`);
+        if (Share) await Share.share({ title: filename, files: [res.uri], dialogTitle: `Send or save ${filename}` }).catch(() => {});
+      } catch {
+        toast(saved ? `Saved to Documents/Kharcha/${filename}.` : 'Couldn’t create the file.');
+      }
+      return;
+    }
     const dl = await downloadsCap;
     if (dl) {
       try { await dl.save({ filename, data: text }); toast(`Saved ${filename}.`); } catch (e) {
@@ -2431,8 +3042,7 @@
     if (v) exportCsv(v);
   }
   function backup() {
-    const data = { app: 'kharcha', v: 1, exportedAt: new Date().toISOString(), data: { txns: state.txns, budgets: state.budgets, goals: state.goals, bills: state.bills, splits: state.splits, customCats: state.customCats, settings: state.settings } };
-    saveFile(`kharcha-backup-${todayStr()}.json`, JSON.stringify(data, null, 1), 'application/json');
+    saveFile(`kharcha-backup-${todayStr()}.json`, JSON.stringify(backupPayload(), null, 1), 'application/json');
   }
   function restoreBackup(file, sheet) {
     const reader = new FileReader();
@@ -2991,6 +3601,11 @@
     'add-split': () => openSplitSheet(),
     'edit-split': (el) => { const s = state.splits.find((x) => x.id === el.dataset.id); if (s) openSplitSheet({ split: s }); },
     settle: (el) => toggleSettle(el.dataset.id, el.dataset.i),
+    'open-friend': (el) => openFriendSheet(el.dataset.key),
+    'wa-request': (el) => requestOnWhatsApp(el.dataset.key),
+    'add-friend': () => addFriend(),
+    'add-with': () => openTxSheet(),
+    'all-splits': () => { ui.allSplits = true; render(); },
     'plan-tab': (el) => { ui.plan = el.dataset.v; prefsSave(); render(); },
     'tools-tab': (el) => { ui.tools = el.dataset.v; prefsSave(); render(); },
     'insight-type': (el) => { ui.insight = el.dataset.v; prefsSave(); render(); },
@@ -3080,6 +3695,20 @@
     window.addEventListener('pagehide', () => { if (saveTimer) flush(); });
   }
 
+  // Android back button: close a dialog, then a sheet, then go to Home, then leave the app.
+  function bindAndroidBack() {
+    const App = nativePlugin('App');
+    if (!App) return;
+    App.addListener('backButton', () => {
+      const scrim = $('#dialog-root .dialog-scrim:last-child');
+      if (scrim) { scrim.dispatchEvent(new MouseEvent('click', { bubbles: true })); return; }
+      const top = sheets[sheets.length - 1];
+      if (top) { top.close(); return; }
+      if (state.loaded && ui.tab !== 'home') { setTab('home'); return; }
+      App.minimizeApp().catch(() => App.exitApp());
+    });
+  }
+
   // ============================================================
   // Boot
   // ============================================================
@@ -3096,6 +3725,7 @@
     applyTheme();
     setCurrency('INR');
     bindGlobal();
+    bindAndroidBack();
     if (FB_CONFIG && !prefs.localOnly) {
       session.mode = 'firebase';
       showGate('loading', { text: 'Starting Kharcha…' });
