@@ -56,10 +56,11 @@ On a phone, open the same address and choose **Add to Home Screen** (Safari) or 
 
 The `mobile/` folder packages the same app as an Android APK with [Capacitor](https://capacitorjs.com). It works fully offline.
 
-- **Install:** copy `Kharcha-1.0.apk` to your phone and open it. Android asks you to allow installing from that app (Files, Drive or Chrome) the first time.
+- **Install:** on your phone, download [`Kharcha-1.1.apk`](mobile/dist/Kharcha-1.1.apk) (on the website it's at `https://YOUR-USERNAME.github.io/kharcha/mobile/dist/Kharcha-1.1.apk`) and open it. Android asks you to allow installing from that app (Files, Drive or Chrome) the first time.
 - **Where data lives:** your book is saved as files inside the app's private storage on the phone. After every change, a full backup is also written to **Documents/Kharcha** on the phone: the latest copy plus one per day for the past week. If you uninstall the app or move to a new phone, install Kharcha again, then go to **Settings → Restore from backup** and pick that file.
 - **Export and Back up** save to Documents/Kharcha and open Android's share menu, so you can send the file to Drive, WhatsApp or email.
 - **Updates keep your data,** as long as the new APK is signed with the same key. The key is stored on the computer that built the app at `~/.kharcha/` and isn't in this repository. Back that folder up: without it, a new version can't install over the old one.
+- **Moving from 1.0 to 1.1:** version 1.0 was signed with a key that has since been lost, so 1.1 can't install over it. In 1.0, open **Settings → Back up data** first. Then uninstall 1.0, install 1.1, and use **Settings → Restore from backup** to pick that file from Documents/Kharcha. Later versions install over 1.1 normally.
 - Google sign-in and syncing inside the Android app come next, after the Firebase project is set up. Until then, the app keeps everything on the phone.
 
 To rebuild the APK after changing the web app (needs Node.js, JDK 21 and the Android SDK):
