@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="kharcha_bg">#10140F</color>
+    <color name="kharcha_nav">#1C211B</color>
+    <bool name="kharcha_light_bars">false</bool>
+</resources>

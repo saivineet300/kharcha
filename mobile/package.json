@@ -1,0 +1,22 @@
+{
+  "name": "kharcha-android",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Android app (APK) build of Kharcha, packaged with Capacitor.",
+  "scripts": {
+    "web": "node scripts/copy-web.mjs",
+    "sync": "npm run web && npx cap sync android",
+    "apk": "npm run sync && cd android && ./gradlew assembleRelease"
+  },
+  "dependencies": {
+    "@capacitor/android": "7.6.9",
+    "@capacitor/app": "^7.1.2",
+    "@capacitor/core": "7.6.9",
+    "@capacitor/filesystem": "^7",
+    "@capacitor/share": "^7",
+    "@capacitor/status-bar": "^7"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "7.6.9"
+  }
+}

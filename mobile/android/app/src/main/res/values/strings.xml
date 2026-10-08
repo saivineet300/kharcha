@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Kharcha</string>
+    <string name="title_activity_main">Kharcha</string>
+    <string name="package_name">io.github.saivineet300.kharcha</string>
+    <string name="custom_url_scheme">io.github.saivineet300.kharcha</string>
+</resources>

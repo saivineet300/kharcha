@@ -1,0 +1,16 @@
+{
+  "appId": "io.github.saivineet300.kharcha",
+  "appName": "Kharcha",
+  "webDir": "www",
+  "android": {
+    "backgroundColor": "#F7FBF2",
+    "adjustMarginsForEdgeToEdge": "disable"
+  },
+  "plugins": {
+    "StatusBar": {
+      "overlaysWebView": false,
+      "backgroundColor": "#F7FBF2",
+      "style": "LIGHT"
+    }
+  }
+}
