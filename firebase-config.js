@@ -1,15 +1,12 @@
 // Firebase settings for the website version of Kharcha (Google sign-in + shared books).
-// Paste the config from Firebase console → Project settings → Your apps → Web app.
+// From Firebase console → Project settings → Your apps → Web app.
 // These values are meant to be public; your data is protected by firestore.rules.
-// Leave it as null and the website works without accounts, saving to this browser only.
-window.KHARCHA_FIREBASE = null;
-
-// Example (replace with your own):
-// window.KHARCHA_FIREBASE = {
-//   apiKey: 'AIza...',
-//   authDomain: 'your-project.firebaseapp.com',
-//   projectId: 'your-project',
-//   storageBucket: 'your-project.firebasestorage.app',
-//   messagingSenderId: '1234567890',
-//   appId: '1:1234567890:web:abc123',
-// };
+// Set it to null and the website works without accounts, saving to this browser only.
+window.KHARCHA_FIREBASE = {
+  apiKey: 'AIzaSyDmG5Z7zpWNNCu3Y0Gysf4-6w4J1QtifAg',
+  authDomain: 'kharcha-a8a57.firebaseapp.com',
+  projectId: 'kharcha-a8a57',
+  storageBucket: 'kharcha-a8a57.firebasestorage.app',
+  messagingSenderId: '893581353074',
+  appId: '1:893581353074:web:b82123574ea2331232e2eb',
+};
