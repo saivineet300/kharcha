@@ -457,6 +457,9 @@
           return { name: str(p.name, 30), share, settled: r.settled, ...(r.paid ? { paid: r.paid } : {}) };
         }),
         ...(s.txnId ? { txnId: str(s.txnId, 40) } : {}),
+        // Category and payment method of the bill, and when it was added (for ordering in Activity).
+        ...(s.cat ? { cat: str(s.cat, 40) } : {}), ...(MODES.some((m) => m.id === s.mode) ? { mode: s.mode } : {}),
+        ...(Number(s.ts) > 0 ? { ts: Number(s.ts) } : {}),
       };
     });
     const friends = [];
@@ -826,19 +829,42 @@
       <span class="label">${monthLabel(ui.month)}${opts.note ? ` <span class="faint">· ${esc(opts.note)}</span>` : ''}</span>
       <button class="icon-btn sm" type="button" data-act="month-next" aria-label="Next month" ${ui.month >= maxMonth() ? 'disabled style="opacity:.3"' : ''}>${ic('chevron_right')}</button>
     </div>`;
+  const shortNames = (names) => (names.length <= 2 ? names.join(' & ') : `${names[0]} +${names.length - 1}`);
   function txItem(t, { showDate = false } = {}) {
     const c = getCat(t.cat);
     const title = t.note || c.name;
     const who = session.book && t.by ? memberName(t.by) : null;
     const sp = t.splitId ? state.splits.find((s) => s.id === t.splitId) : null;
     const mates = sp ? sp.people.map((p) => p.name) : [];
-    const withWho = !mates.length ? null : mates.length <= 2 ? `with ${mates.join(' & ')}` : `with ${mates[0]} +${mates.length - 1}`;
-    const sub = [t.note ? c.name : null, withWho, modeOf(t.mode).name, who, showDate ? dayLabel(t.date) : null].filter(Boolean).join(' · ');
+    const sub = [t.note ? c.name : null, mates.length ? `with ${shortNames(mates)}` : null, modeOf(t.mode).name, who, showDate ? dayLabel(t.date) : null].filter(Boolean).join(' · ');
+    // A split bill shows your share, with the whole bill (or who paid it) underneath.
+    const whole = sp && sp.paidBy === 'me' && sp.total > t.amount + 0.005 ? `of ${money(sp.total)}` : sp && sp.paidBy !== 'me' ? `${sp.paidBy} paid` : '';
     const isIn = t.type === 'income';
     return `<button class="li" type="button" data-act="open-tx" data-id="${esc(t.id)}">
       ${catIco(c)}
       <span class="li-main"><span class="li-title">${esc(title)}</span><span class="li-sub">${esc(sub)}</span></span>
-      <span class="li-end"><span class="amt ${isIn ? 'in' : ''}">${isIn ? '+' : ''}${esc(money(t.amount))}</span></span>
+      <span class="li-end"><span class="amt ${isIn ? 'in' : ''}">${isIn ? '+' : ''}${esc(money(t.amount))}</span>${whole ? `<small class="faint">${esc(whole)}</small>` : ''}</span>
+    </button>`;
+  }
+  // Bills shared with friends that have no expense of yours attached: you paid only for them, or
+  // a friend paid and your share wasn't logged. They show in Activity so nothing goes missing,
+  // but they aren't your spending.
+  function looseSplits() {
+    const ids = new Set(state.txns.map((t) => t.id));
+    return state.splits.filter((s) => !(s.txnId && ids.has(s.txnId)));
+  }
+  const lentIn = (s) => (s.paidBy === 'me' ? round2(sum(s.people, (p) => p.share)) : 0);
+  function splitItem(s, { showDate = false } = {}) {
+    const mine = s.paidBy === 'me';
+    const c = s.cat ? getCat(s.cat) : null;
+    const names = s.people.map((p) => p.name);
+    const sub = [mine ? `Paid for ${shortNames(names)}` : `${s.paidBy} paid ${money(s.total)}`, showDate ? dayLabel(s.date) : null].filter(Boolean).join(' · ');
+    const open = mine ? sum(s.people, shareLeft) > 0 : myLeft(s) > 0;
+    const status = mine ? (open ? `${names.length === 1 ? 'owes' : 'owe'} you` : 'paid back') : open ? 'you owe' : 'settled';
+    return `<button class="li" type="button" data-act="open-split" data-id="${esc(s.id)}">
+      ${c ? catIco(c) : `<span class="cat-ico" style="--h:268">${ic('group')}</span>`}
+      <span class="li-main"><span class="li-title">${esc(s.title)}</span><span class="li-sub">${esc(sub)}</span></span>
+      <span class="li-end"><span class="amt lent">${esc(money(mine ? lentIn(s) : s.myShare))}</span><small class="faint">${esc(status)}</small></span>
     </button>`;
   }
   const emptyState = (icon, title, text, btn = '') => `<div class="empty">${ic(icon)}<b>${esc(title)}</b><span>${esc(text)}</span>${btn}</div>`;
@@ -996,11 +1022,13 @@
           return `<button class="rank-row" type="button" data-act="cat-tx" data-cat="${esc(x.cat)}">${catIco(c, 'sm')}<span class="rank-main"><span class="rank-top"><span class="name">${esc(c.name)}</span><span class="val">${esc(money(x.amt, { whole: true }))}</span></span><span class="rank-bar"><i style="width:${(x.amt / maxTop) * 100}%"></i></span></span></button>`;
         }).join('')}</div></section>` : '';
 
-    // Recent
-    const recent = sortTx([...state.txns]).slice(0, 5);
+    // Recent: entries, plus bills you paid only for friends
+    const recent = [...sortTx([...state.txns]).slice(0, 5).map((t) => ({ date: t.date, ts: t.ts || 0, html: txItem(t, { showDate: true }) })),
+      ...looseSplits().map((s) => ({ date: s.date, ts: s.ts || 0, html: splitItem(s, { showDate: true }) }))]
+      .sort((a, b) => b.date.localeCompare(a.date) || b.ts - a.ts).slice(0, 5);
     const recentHtml = `<section class="card flush">
       <div class="card-head"><h2>Recent</h2>${recent.length ? '<button class="btn btn-text" type="button" data-act="tab" data-tab="txns">See all</button>' : ''}</div>
-      ${recent.length ? `<div class="list">${recent.map((t) => txItem(t, { showDate: true })).join('')}</div>` : emptyState('receipt_long', 'No entries yet', 'Tap “Add expense” or a quick-add tile to log your first one.')}
+      ${recent.length ? `<div class="list">${recent.map((r) => r.html).join('')}</div>` : emptyState('receipt_long', 'No entries yet', 'Tap “Add expense” or a quick-add tile to log your first one.')}
     </section>`;
 
     // Goals
@@ -1085,31 +1113,51 @@
       return true;
     }));
   }
+  // Bills you paid only for friends (or a friend paid) with no expense attached, under the same
+  // filters. They have no payment method, so filtering by one hides them.
+  function filteredSplits() {
+    const f = ui.filter;
+    const q = f.q.trim().toLowerCase();
+    if (f.type === 'income' || f.mode) return [];
+    return looseSplits().filter((s) => {
+      if (!q && !s.date.startsWith(ui.month)) return false;
+      if (f.cat && s.cat !== f.cat) return false;
+      if (q) {
+        const hay = `${s.title} ${s.paidBy === 'me' ? '' : s.paidBy} ${s.people.map((p) => p.name).join(' ')} ${s.total} ${dateLabel(s.date)} ${s.cat ? getCat(s.cat).name : ''}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+  }
   function renderTxList() {
     const host = $('#tx-list');
     if (!host) return;
     const list = filteredTx();
+    const loose = filteredSplits();
     const out = sum(list.filter((t) => t.type === 'expense'), (t) => t.amount);
     const inn = sum(list.filter((t) => t.type === 'income'), (t) => t.amount);
+    const lent = round2(sum(loose, lentIn));
     const scope = ui.filter.q ? 'across all months' : `in ${monthLabel(ui.month)}`;
-    if (!list.length) {
+    if (!list.length && !loose.length) {
       host.innerHTML = `<section class="card">${emptyState(ui.filter.q ? 'search_off' : 'receipt_long', ui.filter.q ? 'No matches' : 'Nothing here yet', ui.filter.q ? 'Try a different word, amount or category.' : `No entries ${scope} with these filters.`)}</section>`;
       return;
     }
+    const rows = [...list.map((t) => ({ date: t.date, ts: t.ts || 0, t })), ...loose.map((sp) => ({ date: sp.date, ts: sp.ts || 0, sp }))]
+      .sort((a, b) => b.date.localeCompare(a.date) || b.ts - a.ts);
     const groups = [];
     let g = null;
-    for (const t of list) {
-      if (!g || g.date !== t.date) { g = { date: t.date, items: [], spent: 0 }; groups.push(g); }
-      g.items.push(t);
-      if (t.type === 'expense') g.spent += t.amount;
+    for (const r of rows) {
+      if (!g || g.date !== r.date) { g = { date: r.date, items: [], spent: 0 }; groups.push(g); }
+      g.items.push(r);
+      if (r.t && r.t.type === 'expense') g.spent += r.t.amount;
     }
     host.innerHTML = `
       <div class="tiles" style="margin-bottom:16px">
-        <div class="tile"><span>Spent ${esc(scope)}</span><b>${esc(money(out))}</b><small>${plural(list.length, 'entry', 'entries')}</small></div>
+        <div class="tile"><span>Spent ${esc(scope)}</span><b>${esc(money(out))}</b><small>${plural(list.length, 'entry', 'entries')}</small>${lent ? `<small>Plus ${esc(money(lent))} paid for friends, not counted</small>` : ''}</div>
         <div class="tile"><span>Received</span><b>${esc(money(inn))}</b></div>
       </div>
       <section class="card flush">
-        ${groups.map((gr) => `<div class="day-head"><span>${esc(dayLabel(gr.date))}</span><span class="num">${gr.spent ? esc(money(gr.spent)) : ''}</span></div><div class="list">${gr.items.map((t) => txItem(t)).join('')}</div>`).join('')}
+        ${groups.map((gr) => `<div class="day-head"><span>${esc(dayLabel(gr.date))}</span><span class="num">${gr.spent ? esc(money(gr.spent)) : ''}</span></div><div class="list">${gr.items.map((r) => (r.t ? txItem(r.t) : splitItem(r.sp))).join('')}</div>`).join('')}
       </section>`;
   }
 
@@ -2041,34 +2089,53 @@
   // Add / edit transaction
   // ============================================================
   let lastMode = 'upi';
+  const clone = (v) => JSON.parse(JSON.stringify(v));
+  // How a split bill divides: everyone the same, the payer not included, or typed amounts.
+  function splitHow(s) {
+    const all = [s.myShare, ...s.people.map((p) => p.share)];
+    const same = (arr) => arr.length > 0 && arr.every((x) => Math.abs(x - arr[0]) < 0.02);
+    const payer = s.paidBy === 'me' ? 0 : s.people.findIndex((p) => p.name === s.paidBy) + 1;
+    return same(all) ? 'equal' : all[payer] < 0.005 && same(all.filter((_, i) => i !== payer)) ? 'others' : 'custom';
+  }
+  // Add or edit an expense or income. opts.tx edits an entry; opts.split edits a bill you paid
+  // for friends that has no expense of yours (you paid only for them).
   function openTxSheet(opts = {}) {
     const tx = opts.tx || null;
+    const linked = opts.split || (tx && tx.splitId ? state.splits.find((x) => x.id === tx.splitId) : null) || null;
+    // A bill you paid is split right here; one a friend paid is edited on its split page.
+    const own = linked && linked.paidBy === 'me' ? linked : null;
+    const theirs = linked && linked.paidBy !== 'me' ? linked : null;
+    const ownTxn = tx || (own && own.txnId ? state.txns.find((t) => t.id === own.txnId) : null) || null;
+    const editing = !!(tx || own);
     const d = {
-      type: tx ? tx.type : opts.type || (opts.cat && INCOME_CATS.some((c) => c.id === opts.cat) ? 'income' : 'expense'),
-      expr: tx ? plainNum(tx.amount) : opts.amount ? plainNum(round2(opts.amount)) : '',
-      cat: tx ? tx.cat : opts.cat || '',
-      mode: tx ? tx.mode : opts.mode || lastMode,
-      date: tx ? tx.date : opts.date || todayStr(),
-      note: tx ? tx.note : opts.note || '',
-      // Friends you paid for along with yourself (new expenses only), and how the bill divides.
-      friends: tx ? [] : (opts.friends || []).slice(),
-      how: 'equal',
+      type: tx ? tx.type : own ? 'expense' : opts.type || (opts.cat && INCOME_CATS.some((c) => c.id === opts.cat) ? 'income' : 'expense'),
+      expr: own ? plainNum(own.total) : tx ? plainNum(tx.amount) : opts.amount ? plainNum(round2(opts.amount)) : '',
+      cat: ownTxn ? ownTxn.cat : own ? own.cat || '' : opts.cat || '',
+      mode: ownTxn ? ownTxn.mode : own ? own.mode || lastMode : opts.mode || lastMode,
+      date: own ? own.date : tx ? tx.date : opts.date || todayStr(),
+      note: tx ? tx.note : own ? own.title : opts.note || '',
+      // Friends you paid for along with yourself, how the bill divides, and typed amounts for 'custom'.
+      friends: own ? own.people.map((p) => p.name) : (opts.friends || []).slice(),
+      how: own ? splitHow(own) : 'equal',
+      custom: {},
     };
+    if (own && d.how === 'custom') {
+      d.custom.me = plainNum(own.myShare);
+      own.people.forEach((p) => { d.custom[fkey(p.name)] = plainNum(p.share); });
+    }
     if (!d.cat || !allCats(d.type).some((c) => c.id === d.cat)) d.cat = allCats(d.type)[0].id;
-    const title = tx ? 'Edit entry' : d.type === 'income' ? 'Add income' : 'Add expense';
-    const linked = tx && tx.splitId ? state.splits.find((x) => x.id === tx.splitId) : null;
     const keys = ['7', '8', '9', '÷', '4', '5', '6', '×', '1', '2', '3', '−', '.', '0', 'del', '+'];
     const keyHtml = keys.map((k) => `<button class="key ${'+−×÷'.includes(k) ? 'op' : ''}" type="button" data-k="${k}" aria-label="${k === 'del' ? 'Backspace' : k}">${k === 'del' ? ic('backspace') : k}</button>`).join('');
     openSheet({
-      title,
+      title: editing ? 'Edit entry' : d.type === 'income' ? 'Add income' : 'Add expense',
       cls: 'tx-sheet',
-      action: tx ? `<button class="icon-btn" type="button" id="tx-delete" aria-label="Delete entry">${ic('delete')}</button>` : '',
+      action: editing ? `<button class="icon-btn" type="button" id="tx-delete" aria-label="Delete entry">${ic('delete')}</button>` : '',
       html: `
-        <div class="seg" role="group" aria-label="Entry type">
+        ${own ? '' : `<div class="seg" role="group" aria-label="Entry type">
           <button type="button" data-type="expense">${ic('check')}Expense</button>
           <button type="button" data-type="income">${ic('check')}Income</button>
-        </div>
-        <div class="amount-box"><div class="amount-line"><div class="amount-display" id="amt-disp" aria-live="polite"></div></div><div class="amount-eval" id="amt-eval"></div></div>
+        </div>`}
+        <div class="amount-box"><div class="amount-label" id="amt-label"></div><div class="amount-line"><div class="amount-display" id="amt-disp" aria-live="polite"></div></div><div class="amount-eval" id="amt-eval"></div></div>
         <div><div class="section-title" style="padding:0 0 4px">Category</div><div class="cat-grid" id="cat-grid" role="group" aria-label="Category"></div></div>
         <div id="tx-split" class="tx-split"></div>
         <div class="row2">
@@ -2076,53 +2143,70 @@
           <label class="field"><span id="mode-label">Paid with</span><select id="tx-mode">${MODES.map((m) => `<option value="${m.id}" ${m.id === d.mode ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}</select>${ic('arrow_drop_down', 'select-ico')}</label>
         </div>
         <label class="field"><span>Note</span><input id="tx-note" maxlength="80" autocomplete="off" placeholder="e.g. Lunch with team" value="${esc(d.note)}"></label>
-        ${linked ? `<div class="storage-note">${ic('group')}<span>Your share of “${esc(linked.title)}” (${esc(money(linked.total))} with ${esc(namesList(linked.people.map((p) => p.name)))}). Changing this entry doesn’t change what anyone owes.</span><button class="btn btn-text" type="button" id="tx-edit-split">Edit split</button></div>` : ''}`,
+        ${theirs ? `<div class="storage-note">${ic('group')}<span>Your share of “${esc(theirs.title)}”, which ${esc(theirs.paidBy)} paid (${esc(money(theirs.total))}). Changing this entry doesn’t change what you owe.</span><button class="btn btn-text" type="button" id="tx-edit-split">Edit split</button></div>` : ''}`,
       foot: `<div class="keypad" id="keypad">${keyHtml}<button class="key save" type="button" id="tx-save">${ic('check')}Save</button></div>`,
       onMount(el, sh) {
         const disp = $('#amt-disp', el), evalEl = $('#amt-eval', el);
+        const sharing = () => d.type === 'expense' && !theirs && d.friends.length > 0;
+        const total = () => { const r = safeEval(d.expr); return r.ok ? round2(r.value) : 0; };
+        // Shares for you (index 0) and each friend, in the order picked.
+        const sharesFor = (amount) => (d.how === 'custom'
+          ? [d.custom.me, ...d.friends.map((n) => d.custom[fkey(n)])].map((v) => round2(Math.max(0, num(v))))
+          : divideBill(amount, d.friends, 'me', d.how));
         const drawType = () => {
           $$('[data-type]', el).forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.type === d.type)));
           $('#mode-label', el).textContent = d.type === 'income' ? 'Received in' : 'Paid with';
           $('#cat-grid', el).innerHTML = allCats(d.type).map((c) => `<button class="cat-opt" type="button" data-cat="${esc(c.id)}" aria-pressed="${c.id === d.cat}">${catIco(c)}<span>${esc(c.short || c.name)}</span></button>`).join('');
           const sel = $(`.cat-opt[aria-pressed="true"]`, el);
           if (sel) sel.scrollIntoView({ block: 'nearest', inline: 'center' });
-          $('h2', el).textContent = tx ? 'Edit entry' : d.type === 'income' ? 'Add income' : 'Add expense';
+          $('h2', el).textContent = editing ? 'Edit entry' : d.type === 'income' ? 'Add income' : 'Add expense';
           drawSplit();
         };
         // "Split with friends": pick who you paid for; your part is logged, theirs goes on their tab.
         const drawSplit = () => {
           const box = $('#tx-split', el);
-          box.hidden = !!tx || d.type !== 'expense';
+          box.hidden = !!theirs || d.type !== 'expense';
+          $('#amt-label', el).textContent = sharing() ? 'Total you paid' : '';
           if (box.hidden) { box.innerHTML = ''; return; }
           const picked = (n) => d.friends.some((x) => fkey(x) === fkey(n));
           const known = [...friendLedger().values()].sort((a, b) => b.last.localeCompare(a.last) || a.name.localeCompare(b.name)).map((f) => f.name);
           const names = [...d.friends, ...known.filter((n) => !picked(n)).slice(0, 10)];
           const n = d.friends.length;
+          const shareField = (k, label) => `<label class="field"><span>${esc(label)}</span><span class="affix"><b>${esc(cur.symbol)}</b><input data-cshare="${esc(k)}" inputmode="decimal" autocomplete="off" value="${esc(d.custom[k] ?? '')}"></span></label>`;
           box.innerHTML = `<div class="section-title" style="padding:0 0 6px">Split with friends <span class="faint">· optional</span></div>
             <div class="chip-row">${names.map((nm) => `<button class="chip" type="button" data-friend="${esc(nm)}" aria-pressed="${picked(nm)}">${picked(nm) ? ic('check') : ''}${esc(nm)}</button>`).join('')}
               <button class="chip" type="button" id="tx-addfriend">${ic('person_add')}${names.length ? 'Someone else' : 'Add a friend'}</button></div>
             ${n ? `<div class="seg" role="group" aria-label="How to split">
                 <button type="button" data-how="equal" aria-pressed="${d.how === 'equal'}">${ic('check')}Split equally</button>
-                <button type="button" data-how="others" aria-pressed="${d.how === 'others'}">${ic('check')}Paid for ${n === 1 ? 'them' : 'all of them'}</button></div>
-              <p class="hint" id="tx-split-sum" aria-live="polite"></p>` : ''}`;
+                <button type="button" data-how="others" aria-pressed="${d.how === 'others'}">${ic('check')}Paid for ${n === 1 ? 'them' : 'all'}</button>
+                <button type="button" data-how="custom" aria-pressed="${d.how === 'custom'}">${ic('check')}Custom</button></div>
+              ${d.how === 'custom' ? `<div class="custom-shares">${shareField('me', 'You')}${d.friends.map((nm) => shareField(fkey(nm), nm)).join('')}</div>` : ''}
+              <p class="hint" id="tx-split-sum" aria-live="polite"></p>` : ''}
+            ${own && !n ? `<p class="hint">Saving removes the split, and the full amount becomes your spending.</p>` : ''}`;
           drawSplitSum();
         };
         const drawSplitSum = () => {
           const out = $('#tx-split-sum', el);
           if (!out) return;
-          const r = safeEval(d.expr);
-          const total = r.ok ? round2(r.value) : 0;
+          const amount = total();
           const who = namesList(d.friends), owes = d.friends.length === 1 ? 'owes' : 'owe';
-          if (!(total > 0)) {
-            out.textContent = d.how === 'equal' ? `Enter the full amount you paid. It’s shared by ${d.friends.length + 1} people.` : `Enter the amount you paid. ${who} ${owes} you all of it.`;
+          if (!(amount > 0)) {
+            out.textContent = d.how === 'others' ? `Enter the amount you paid. ${who} ${owes} you all of it.` : `Enter the full amount you paid for everyone.`;
             return;
           }
-          const shares = divideBill(total, d.friends, 'me', d.how);
-          const theirs = round2(total - shares[0]);
-          const each = d.friends.length > 1 ? ` (${esc(money(shares[d.friends.length]))} each)` : '';
-          out.innerHTML = d.how === 'equal'
-            ? `<b>${esc(money(shares[0]))}</b> is your spending · ${esc(who)} ${owes} you <b>${esc(money(theirs))}</b>${each}`
-            : `${esc(who)} ${owes} you <b>${esc(money(theirs))}</b>${each} · nothing is added to your spending`;
+          const shares = sharesFor(amount);
+          const theirsAmt = round2(sum(shares.slice(1)));
+          if (d.how === 'custom') {
+            const left = round2(amount - shares[0] - theirsAmt);
+            if (Math.abs(left) >= 0.01) {
+              out.innerHTML = left > 0 ? `<b>${esc(money(left))}</b> of ${esc(money(amount))} still to assign` : `Shares are <b>${esc(money(-left))}</b> more than ${esc(money(amount))}`;
+              return;
+            }
+          }
+          const each = d.how !== 'custom' && d.friends.length > 1 ? ` (${esc(money(shares[d.friends.length]))} each)` : '';
+          out.innerHTML = shares[0] > 0
+            ? `<b>${esc(money(shares[0]))}</b> is your spending · ${esc(who)} ${owes} you <b>${esc(money(theirsAmt))}</b>${each}`
+            : `${esc(who)} ${owes} you <b>${esc(money(theirsAmt))}</b>${each} · nothing is added to your spending`;
         };
         const drawAmt = () => {
           disp.classList.toggle('placeholder', !d.expr);
@@ -2145,8 +2229,17 @@
           }
           drawAmt();
         };
+        const flash = (msg) => {
+          evalEl.textContent = msg;
+          evalEl.style.color = 'var(--error)';
+          setTimeout(() => { evalEl.style.color = ''; }, 2200);
+        };
         drawType();
         drawAmt();
+        el.addEventListener('input', (e) => {
+          const k = e.target.dataset.cshare;
+          if (k !== undefined) { d.custom[k] = e.target.value; drawSplitSum(); }
+        });
         el.addEventListener('click', (e) => {
           const b = e.target.closest('button');
           if (!b) return;
@@ -2157,13 +2250,21 @@
             const nm = b.dataset.friend;
             d.friends = d.friends.some((x) => fkey(x) === fkey(nm)) ? d.friends.filter((x) => fkey(x) !== fkey(nm)) : [...d.friends, nm];
             drawSplit();
-          } else if (b.dataset.how) { d.how = b.dataset.how; drawSplit(); }
-          else if (b.id === 'tx-addfriend') {
+          } else if (b.dataset.how) {
+            // Custom starts from the equal split, so only the amounts that differ need typing.
+            if (b.dataset.how === 'custom' && d.how !== 'custom' && total() > 0) {
+              const start = divideBill(total(), d.friends, 'me', d.how);
+              d.custom = { me: plainNum(start[0]) };
+              d.friends.forEach((nm, i) => { d.custom[fkey(nm)] = plainNum(start[i + 1]); });
+            }
+            d.how = b.dataset.how;
+            drawSplit();
+          } else if (b.id === 'tx-addfriend') {
             askFriendName().then((nm) => {
               if (nm && !d.friends.some((x) => fkey(x) === fkey(nm))) d.friends.push(nm);
               drawSplit();
             });
-          } else if (b.id === 'tx-edit-split') { sh.close(); openSplitSheet({ split: linked }); }
+          } else if (b.id === 'tx-edit-split') { sh.close(); openSplitSheet({ split: theirs }); }
           else if (b.id === 'tx-save') save();
           else if (b.id === 'tx-delete') del();
         });
@@ -2177,43 +2278,87 @@
           else if (e.key === 'Enter') { save(); e.preventDefault(); }
         };
         function save() {
-          const r = safeEval(d.expr);
-          const amount = r.ok ? round2(r.value) : 0;
-          if (!(amount > 0)) {
-            evalEl.textContent = d.expr ? 'Amount must be more than zero' : 'Enter an amount using the keypad';
-            evalEl.style.color = 'var(--error)';
-            setTimeout(() => { evalEl.style.color = ''; }, 1600);
-            return;
-          }
+          const amount = total();
+          if (!(amount > 0)) { flash(d.expr ? 'Amount must be more than zero' : 'Enter an amount using the keypad'); return; }
           const date = $('#tx-date', el).value || todayStr();
           const rec = {
-            ...(tx || {}),
-            id: tx ? tx.id : uid(), type: d.type, amount, cat: d.cat, mode: $('#tx-mode', el).value,
-            date: isDateStr(date) ? date : todayStr(), note: $('#tx-note', el).value.trim().slice(0, 80), ts: tx ? tx.ts : Date.now(),
-            ...(session.user ? { by: (tx && tx.by) || session.user.uid } : {}),
+            ...(ownTxn || {}),
+            id: ownTxn ? ownTxn.id : uid(), type: d.type, amount, cat: d.cat, mode: $('#tx-mode', el).value,
+            date: isDateStr(date) ? date : todayStr(), note: $('#tx-note', el).value.trim().slice(0, 80), ts: ownTxn ? ownTxn.ts : Date.now(),
+            ...(session.user ? { by: (ownTxn && ownTxn.by) || session.user.uid } : {}),
           };
+          delete rec.splitId;
           lastMode = rec.mode;
-          if (!tx && rec.type === 'expense' && d.friends.length) { saveShared(rec); return; }
+          if (sharing()) { saveShared(rec); return; }
+          if (own) { unsplit(rec); return; }
+          if (theirs) rec.splitId = theirs.id;
           const fresh = commit(() => upsert(state.txns, rec));
           sh.close();
           toast((tx ? 'Changes saved.' : `Added ${money(amount)} · ${getCat(rec.cat).name}.`) + budgetNote(rec) + freshNote(fresh));
         }
         // You paid the whole bill: your share becomes the expense, the rest goes on your friends' tabs.
+        // Editing keeps what each friend has already paid back.
         function saveShared(rec) {
           const names = d.friends.map((x) => x.trim().slice(0, 30));
-          const shares = divideBill(rec.amount, names, 'me', d.how);
+          const shares = sharesFor(rec.amount);
+          if (Math.abs(sum(shares) - rec.amount) > 0.01) { flash(`Shares need to add up to ${money(rec.amount)}`); return; }
+          const before = own ? own.people : [];
+          const people = names.map((name, i) => {
+            const share = shares[i + 1];
+            const old = before.find((p) => fkey(p.name) === fkey(name));
+            const back = old ? Math.min(share, old.settled ? old.share : old.paid || 0) : 0;
+            const settled = share > 0 && back >= share - 0.005;
+            return { name, share, settled, ...(back > 0 && !settled ? { paid: round2(back) } : {}) };
+          });
+          const keepTitle = own && rec.note === (tx ? tx.note : own.title);
           const split = {
-            id: uid(), title: (rec.note || getCat(rec.cat).name).slice(0, 50), date: rec.date, total: rec.amount, paidBy: 'me', myShare: shares[0], iSettled: false,
-            people: names.map((name, i) => ({ name, share: shares[i + 1], settled: false })),
+            ...(own ? clone(own) : {}),
+            id: own ? own.id : uid(), title: keepTitle ? own.title : (rec.note || getCat(rec.cat).name).slice(0, 50), date: rec.date, total: rec.amount,
+            paidBy: 'me', myShare: shares[0], iSettled: false, people, cat: rec.cat, mode: rec.mode, ts: (own && own.ts) || rec.ts,
           };
+          delete split.myPaid;
           const txn = shares[0] > 0 ? { ...rec, amount: shares[0], splitId: split.id } : null;
-          if (txn) split.txnId = txn.id;
-          const fresh = commit(() => { state.splits.push(split); if (txn) state.txns.push(txn); });
+          if (txn) split.txnId = txn.id; else delete split.txnId;
+          const fresh = commit(() => {
+            upsert(state.splits, split);
+            if (txn) upsert(state.txns, txn);
+            else if (ownTxn) state.txns = state.txns.filter((t) => t.id !== ownTxn.id);
+          });
           sh.close();
-          const owe = `${namesList(names)} ${names.length === 1 ? 'owes' : 'owe'} you ${money(round2(rec.amount - shares[0]))}.`;
-          toast((txn ? `Added ${money(txn.amount)} · ${getCat(txn.cat).name}. ${owe}` : `${owe} Nothing added to your spending.`) + (txn ? budgetNote(txn) : '') + freshNote(fresh));
+          const left = round2(sum(people, shareLeft)), back = round2(rec.amount - shares[0] - left);
+          const who = namesList(names), owes = names.length === 1 ? 'owes' : 'owe';
+          const owe = !(left > 0) ? `${who} already paid you back for this.`
+            : back > 0 ? `${who} ${owes} you ${money(left)} more for this (${money(back)} already paid back).`
+            : `${who} ${owes} you ${money(left)}${editing ? ' for this' : ''}.`;
+          const lead = editing ? 'Saved. ' : '';
+          toast(lead + (txn ? `${editing ? `${money(txn.amount)} is your spending` : `Added ${money(txn.amount)} · ${getCat(txn.cat).name}`}. ${owe}` : `${owe} Nothing added to your spending.`) + (txn ? budgetNote(txn) : '') + freshNote(fresh));
         }
-        function del() {
+        // Everyone was taken off a bill you'd split: it goes back to being all your spending.
+        async function unsplit(rec) {
+          const repaid = own.people.some((p) => p.settled || p.paid);
+          const ok = await confirmDialog('Remove the split?', `${namesList(own.people.map((p) => p.name))} won’t owe you anything for “${own.title}”, and all ${money(rec.amount)} becomes your spending.${repaid ? ' What they’ve paid back for it is cleared too.' : ''}`, 'Remove split');
+          if (!ok) return;
+          const before = { split: clone(own), txn: ownTxn ? { ...ownTxn } : null };
+          commit(() => { state.splits = state.splits.filter((x) => x.id !== own.id); upsert(state.txns, rec); });
+          sh.close();
+          toast(`Split removed. ${money(rec.amount)} is your spending.`, { label: 'Undo', run: () => commit(() => {
+            upsert(state.splits, before.split);
+            if (before.txn) upsert(state.txns, before.txn); else state.txns = state.txns.filter((t) => t.id !== rec.id);
+          }) });
+        }
+        async function del() {
+          if (own) {
+            const names = own.people.map((p) => p.name);
+            if (!(await confirmDialog('Delete this expense?', `It also removes what ${namesList(names)} ${names.length === 1 ? 'owes' : 'owe'} you for “${own.title}”.`, 'Delete', true))) return;
+            const before = { split: clone(own), txn: ownTxn ? { ...ownTxn } : null };
+            commit(() => {
+              state.splits = state.splits.filter((x) => x.id !== own.id);
+              if (ownTxn) state.txns = state.txns.filter((t) => t.id !== ownTxn.id);
+            }, { keepSample: true });
+            sh.close();
+            toast('Deleted.', { label: 'Undo', run: () => commit(() => { upsert(state.splits, before.split); if (before.txn) upsert(state.txns, before.txn); }, { keepSample: true }) });
+            return;
+          }
           const snapshot = { ...tx };
           commit(() => { state.txns = state.txns.filter((t) => t.id !== tx.id); }, { keepSample: true });
           sh.close();
@@ -2399,12 +2544,7 @@
     const s = split ? JSON.parse(JSON.stringify(split)) : { id: uid(), title: '', date: todayStr(), total: '', paidBy: 'me', myShare: 0, iSettled: false, people: [{ name: '', share: 0, settled: false }], ...JSON.parse(JSON.stringify(preset || {})) };
     // how: 'equal' (everyone the same), 'others' (the payer isn't part of it), 'custom' (typed shares).
     const m = { how: 'equal', addExpense: !split, cat: 'food' };
-    if (split) {
-      const all = [s.myShare, ...s.people.map((p) => p.share)];
-      const same = (arr) => arr.every((x) => Math.abs(x - arr[0]) < 0.02);
-      const payer = s.paidBy === 'me' ? 0 : s.people.findIndex((p) => p.name === s.paidBy) + 1;
-      m.how = same(all) ? 'equal' : all[payer] < 0.005 && same(all.filter((_, i) => i !== payer)) ? 'others' : 'custom';
-    }
+    if (split) m.how = splitHow(s);
     const sheet = openSheet({
       title: split ? 'Edit split' : 'Split an expense',
       action: split ? `<button class="icon-btn" type="button" id="sp-del" aria-label="Delete split">${ic('delete')}</button>` : '',
@@ -2544,7 +2684,8 @@
             toast('Shares need to add up to the total.');
             return;
           }
-          const rec = { ...s, title: title.slice(0, 50), total, myShare, paidBy, people, date: isDateStr(s.date) ? s.date : todayStr() };
+          const rec = { ...s, title: title.slice(0, 50), total, myShare, paidBy, people, date: isDateStr(s.date) ? s.date : todayStr(), ts: s.ts || Date.now() };
+          if (!split && m.addExpense) rec.cat = m.cat;
           if (split && split.paidBy !== rec.paidBy) { people.forEach((p) => { p.settled = false; delete p.paid; }); rec.iSettled = false; delete rec.myPaid; }
           if (rec.paidBy !== 'me') people.forEach((p) => { if (p.name === rec.paidBy) { p.settled = true; delete p.paid; } });
           let txn = null, linked = null, dropId = null;
@@ -2884,7 +3025,7 @@
           <label class="set-item" style="cursor:pointer">${ic('settings_backup_restore')}<span class="li-main"><span>Restore from backup</span><small>Replaces what’s here with the file’s data</small></span><input type="file" id="st-restore" accept="${CAP ? '*/*' : 'application/json,.json'}" hidden></label>
           ${session.book ? '' : `<button class="set-item" type="button" data-set="sample">${ic('science')}<span class="li-main"><span>Show sample data</span><small>Explore with example entries. Nothing is saved.</small></span></button>`}
           ${session.mode !== 'firebase' || !session.book || session.book.owner === session.user.uid ? `<button class="set-item danger" type="button" data-set="wipe">${ic('delete_forever')}<span class="li-main"><span>Delete all data${session.book ? ' in this book' : ''}</span><small>Removes every entry, budget, bill, goal and split${session.book ? ' for everyone in it' : ''}</small></span></button>` : ''}</div>
-        <p class="hint" style="text-align:center">Kharcha · version 1.1</p>`,
+        <p class="hint" style="text-align:center">Kharcha · version 1.2</p>`,
       onMount(el) {
         el.addEventListener('change', async (e) => {
           if (e.target.id === 'st-name') commit(() => { state.settings.name = e.target.value.trim().slice(0, 40); }, { keepSample: true });
@@ -3141,7 +3282,10 @@
             if (!settled) {
               latest[col] = snap;
               if (!snap.metadata.fromCache) fromServer.add(col);
-              if (fromServer.size === BOOK_COLS.length) finish();
+              // Open as soon as this device's saved copy of the book is read (the server's answer
+              // then streams in as changes), or, with nothing saved here yet, once the server answers.
+              const cached = BOOK_COLS.every((c) => latest[c]) && !latest.meta.empty;
+              if (cached || fromServer.size === BOOK_COLS.length) finish();
               return;
             }
             const changes = snap.docChanges().map((ch) => ({ key: `${col}/${ch.doc.id}`, data: ch.type === 'removed' ? null : ch.doc.data() }));
@@ -3600,6 +3744,14 @@
     'pay-bill': (el) => payBill(el.dataset.id),
     'add-split': () => openSplitSheet(),
     'edit-split': (el) => { const s = state.splits.find((x) => x.id === el.dataset.id); if (s) openSplitSheet({ split: s }); },
+    'open-split': (el) => {
+      const s = state.splits.find((x) => x.id === el.dataset.id);
+      if (!s) return;
+      const t = s.txnId ? state.txns.find((x) => x.id === s.txnId) : null;
+      if (s.paidBy !== 'me') openSplitSheet({ split: s });
+      else if (t) openTxSheet({ tx: t });
+      else openTxSheet({ split: s });
+    },
     settle: (el) => toggleSettle(el.dataset.id, el.dataset.i),
     'open-friend': (el) => openFriendSheet(el.dataset.key),
     'wa-request': (el) => requestOnWhatsApp(el.dataset.key),

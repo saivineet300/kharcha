@@ -76,8 +76,10 @@ The signed APK is written to `mobile/android/app/build/outputs/apk/release/app-r
 ## Friends: paying for each other
 
 - **You paid for you and a friend:** tap **Add expense**, enter the full amount, and pick the friend under **Split with friends**. With **Split equally**, your half is added to your spending and the other half goes on the friend's tab.
-- **You paid only for them** (their ticket, their shopping): pick the friend and choose **Paid for them**. Nothing is added to your spending, and they owe you all of it.
-- **A friend paid:** go to **Plan → Friends**, open the friend and tap **[name] paid**. For bills with several people or uneven shares, use **Split a bill**.
+- **You paid only for them** (their ticket, their shopping): pick the friend and choose **Paid for them**. Nothing is added to your spending, and they owe you all of it. It still shows in Activity and Recent as "Paid for [name]", so you can see you logged it.
+- **Uneven shares:** choose **Custom** and type each person's amount. They need to add up to the total.
+- **Split it later:** open an expense you already added and pick friends under **Split with friends**. The amount becomes the total you paid, and only your share stays in your spending.
+- **A friend paid:** go to **Plan → Friends**, open the friend and tap **[name] paid**.
 - **See the total:** **Plan → Friends** lists everyone with what they owe you. What they owe and what you owe them cancel out.
 - **Ask for the money:** open a friend and tap **Request on WhatsApp**. Your phone opens WhatsApp with a message listing each item and the total. Save their number once, or choose the chat in WhatsApp. Add your UPI ID in **Settings → Money** and it's included in the message.
 - **When they pay you back:** tap **Record payment**. The full amount settles everything. A smaller amount pays off their oldest items first.
